@@ -43,6 +43,13 @@ func (lk *Lock) Acquire() {
 			if err == rpc.OK {
 				return
 			}
+			if err == rpc.ErrMaybe {
+				nowId, version, err = lk.ck.Get(lk.lockname)
+				if err == rpc.OK && nowId == lk.id {
+					return
+				}
+			}
+
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
