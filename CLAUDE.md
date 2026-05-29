@@ -77,6 +77,10 @@ go run mrworker.go wc.so &            # start workers (one per invocation)
   - Remote URL: `https://github.com/lqh0926/6.5840_2026.git`
   - Push command: `git push mygithub master`
 
+## Bug Log
+
+See [BUGS.md](BUGS.md) for a record of all valuable bugs encountered during implementation. When a non-trivial bug is found and fixed, append it to BUGS.md using the existing format (BUG-XXX, 文件/错误代码/问题/正确做法/核心不变式).
+
 ## Key Patterns
 
 - All servers use `sync.Mutex` for concurrency control.
