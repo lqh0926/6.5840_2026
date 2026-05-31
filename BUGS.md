@@ -6,7 +6,7 @@ Valuable bugs encountered during 6.5840 lab implementation. Careless/trivial omi
 
 ## Lab 3 — Raft
 
-### BUG-001 · voteFor 在同 term 内被错误重置导致 split-brain
+### BUG-001 · voteFor 在同 term 内被错误重置导致 split-brain　`【High】`
 
 **文件**: `src/raft1/raft.go` — `AppendEntriesHandler`
 
@@ -36,7 +36,7 @@ rf.leaderId = args.LeaderId
 
 ---
 
-### BUG-002 · startElection goroutine 在运行时才读 rf.term，可能发出错误 term 的 RequestVote
+### BUG-002 · startElection goroutine 在运行时才读 rf.term，可能发出错误 term 的 RequestVote　`【Medium】`
 
 **文件**: `src/raft1/raft.go` — `startElection` / `sendRequestVote`
 
@@ -91,7 +91,7 @@ func (rf *Raft) startElection() {
 
 ---
 
-### BUG-003 · AppendEntries reject 时未重置选举计时器，导致频繁重新选举
+### BUG-003 · AppendEntries reject 时未重置选举计时器，导致频繁重新选举　`【High】`
 
 **文件**: `src/raft1/raft.go` — `AppendEntriesHandler`
 
@@ -126,7 +126,7 @@ if args.PrevLogIndex >= len(rf.logs) || ... {
 
 ---
 
-### BUG-004 · RequestVote 授予投票后未重置选举计时器
+### BUG-004 · RequestVote 授予投票后未重置选举计时器　`【Medium】`
 
 **文件**: `src/raft1/raft.go` — `RequestVote`
 
@@ -152,7 +152,7 @@ select { case rf.resetCh <- struct{}{}: default: }  // ✅
 
 ---
 
-### BUG-005 · startHeartbeat 中 LeaderCommit 在 goroutine 内读取，存在数据竞争
+### BUG-005 · startHeartbeat 中 LeaderCommit 在 goroutine 内读取，存在数据竞争　`【High】`
 
 **文件**: `src/raft1/raft.go` — `startHeartbeat`
 
@@ -187,7 +187,7 @@ go func(server int) {
 ---
 
 
-### BUG-006 · 当选 leader 时未重置 peerLastIndex，导致错误统计 majority
+### BUG-006 · 当选 leader 时未重置 peerLastIndex，导致错误统计 majority　`【High】`
 
 **文件**: `src/raft1/raft.go` — `sendRequestVote`
 
@@ -217,7 +217,7 @@ if rf.voteCount > len(rf.peers)/2 {
 
 ---
 
-### BUG-008 · AppendEntries 快速回退：冲突 term 用了 leader 的期望值而非 follower 的实际值，导致 LastMatchIndex == prevLogIndex 死循环
+### BUG-008 · AppendEntries 快速回退：冲突 term 用了 leader 的期望值而非 follower 的实际值，导致 LastMatchIndex == prevLogIndex 死循环　`【Medium】`
 
 **文件**: `src/raft1/raft.go` — `AppendEntriesHandler`
 
@@ -254,5 +254,53 @@ if args.PrevLogIndex < len(rf.logs) {
 ```
 
 **核心不变式**: 快速回退的冲突 term 必须来自 follower 自身日志，不能用 leader 传来的期望值；当 prevLogIndex 越界时，若只维护 matchIndex 则无法加速，只能返回 0。
+
+---
+
+### BUG-009 · sendAppendEntries failure 回复无 stale 保护，乱序回复导致 peerLastIndex 倒退　`【Medium】`
+
+**文件**: `src/raft1/raft.go` — `sendAppendEntries`
+
+**错误代码**:
+```go
+} else {
+    if reply.LastMatchIndex > 0 {
+        rf.peerLastIndex[server] = reply.LastMatchIndex  // ❌ 无条件写，可能倒退
+    } else {
+        rf.peerLastIndex[server] = 0
+    }
+}
+```
+
+**问题**: labrpc longreordering 模式下，RPC 回复最多延迟 2000ms，而心跳每 100ms 发一次。一个旧轮次的 failure 回复（`LastMatchIndex=0`）可能在 peerLastIndex 已经被后续 success 回复推进到 15 之后才到达，把 peerLastIndex 从 15 打回 0。
+
+此外 `sendAppendEntries` 没有像 `sendRequestVote` 那样的 stale 保护（`rf.term == args.Term && rf.customerId == Leader`），stepDown 之后也会继续执行 failure 路径，写入无意义的 peerLastIndex。
+
+两个问题叠加结果：leader 误以为 follower 什么都没有，下次心跳把整个日志重发一遍；如果两个 follower 都被打回 0，新 entry 的 majority 计数归零，commit 延迟一个心跳周期。
+
+**危害程度说明**: follower 的 log 实际上没有丢失（log 持久化 + AppendEntriesHandler 幂等），所以正确性不受影响；纯粹是性能/活性问题，极端情况可能导致 TestCount3B（RPC 次数上限）超出。
+
+**正确做法**:
+```go
+if reply.Term > rf.term {
+    rf.stepDown(reply.Term)
+    return ok  // ✅ stepDown 后直接返回
+}
+// ✅ 丢弃 stale 回复
+if rf.term != args.Term || rf.customerId != Leader {
+    return ok
+}
+if reply.Success {
+    ...
+} else {
+    // ✅ args.PrevLogIndex 已落后于当前确认值，说明这是一个乱序的旧 failure 回复
+    if args.PrevLogIndex < rf.peerLastIndex[server] {
+        return ok
+    }
+    rf.peerLastIndex[server] = reply.LastMatchIndex
+}
+```
+
+**核心原则**: success 路径用 `max()` 保证 peerLastIndex 单调递增；failure 路径同理需要保证不被乱序回复倒退，判断依据是 `args.PrevLogIndex` 是否已经落后于当前确认值。
 
 ---

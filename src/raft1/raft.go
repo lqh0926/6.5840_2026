@@ -9,12 +9,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"log"
 	"math/rand"
 	"sync"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -94,32 +96,34 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.logs)
+	e.Encode(rf.voteFor)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var logs []LogEntry
+	var voteFor int
+	if d.Decode(&term) != nil || d.Decode(&logs) != nil || d.Decode(&voteFor) != nil {
+		log.Fatalf("Failed to read persisted state")
+	} else {
+		rf.term = term
+		rf.logs = logs
+		rf.voteFor = voteFor
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -162,6 +166,7 @@ func (rf *Raft) stepDown(newTerm int) {
 	rf.leaderId = -1
 	rf.voteFor = -1
 	rf.voteCount = 0
+	rf.persist()
 }
 
 // example RequestVote RPC handler.
@@ -175,6 +180,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if args.Term > rf.term {
 		rf.stepDown(args.Term)
+
 	}
 	// If the candidate's log is at least as up-to-date as receiver's log, grant vote
 	lastLogIndex := len(rf.logs) - 1
@@ -183,6 +189,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
+		rf.persist()
 		select {
 		case rf.resetCh <- struct{}{}:
 		default:
@@ -223,7 +230,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntries, reply *AppendEntriesRe
 				}
 			}
 		}
-		// prevLogIndex 越界时 LastMatchIndex=0，leader 从头重试
+		// prevLogIndex 越界（log 太短）或冲突 term 贯穿全 log 时 LastMatchIndex=0，leader 从头重试
 		rf.mu.Unlock()
 		return
 	}
@@ -233,6 +240,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntries, reply *AppendEntriesRe
 	if len(args.Entries) > 0 {
 		rf.logs = rf.logs[:args.PrevLogIndex+1]
 		rf.logs = append(rf.logs, args.Entries...)
+		rf.persist()
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
@@ -249,10 +257,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntries, reply *Append
 		defer rf.mu.Unlock()
 		if reply.Term > rf.term {
 			rf.stepDown(reply.Term)
+			return ok
+		}
+		// 丢弃 stale 回复：term 已变或已不是 leader
+		if rf.term != args.Term || rf.customerId != Leader {
+			return ok
 		}
 		if reply.Success {
 			rf.peerLastIndex[server] = max(rf.peerLastIndex[server], args.PrevLogIndex+len(args.Entries))
-			// Check if there are new entries that can be committed
 			prevCommitIndex := rf.commitIndex
 			for N := rf.commitIndex + 1; N < len(rf.logs); N++ {
 				matchCount := 1
@@ -269,12 +281,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntries, reply *Append
 				rf.applyCond.Signal()
 			}
 		} else {
-			// If AppendEntries fails because of log inconsistency, update nextIndex and retry
-			if reply.LastMatchIndex > 0 {
-				rf.peerLastIndex[server] = reply.LastMatchIndex
-			} else {
-				rf.peerLastIndex[server] = 0
+			// 丢弃乱序 failure 回复：已确认 peer 有更多 entry，这个回复是过期的
+			if args.PrevLogIndex < rf.peerLastIndex[server] {
+				return ok
 			}
+			rf.peerLastIndex[server] = reply.LastMatchIndex
 		}
 	}
 	return ok
@@ -350,6 +361,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.logs)
 	term := rf.term
 	rf.logs = append(rf.logs, LogEntry{Command: command, Term: term})
+	rf.persist()
 	return index, term, true
 }
 
@@ -364,6 +376,7 @@ func (rf *Raft) startElection() {
 	rf.customerId = Candidate
 	rf.voteFor = rf.me
 	rf.voteCount = 1
+	rf.persist()
 	lastLogIndex := len(rf.logs) - 1
 	lastLogTerm := rf.logs[lastLogIndex].Term
 	term := rf.term
@@ -519,7 +532,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) logStatus() {
 	roleNames := []string{"Leader", "Follower", "Candidate"}
 	for {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(2000 * time.Millisecond)
 		rf.mu.Lock()
 		role := roleNames[rf.customerId]
 		term := rf.term
