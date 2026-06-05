@@ -304,3 +304,153 @@ if reply.Success {
 **核心原则**: success 路径用 `max()` 保证 peerLastIndex 单调递增；failure 路径同理需要保证不被乱序回复倒退，判断依据是 `args.PrevLogIndex` 是否已经落后于当前确认值。
 
 ---
+
+### BUG-010 · peerLastIndex 同时充当 matchIndex 和 nextIndex，导致 quorum 统计被 failure 路径破坏　`【High】`
+
+**文件**: `src/raft1/raft.go` — `Raft` struct、`sendAppendEntries`、`startHeartbeat`
+
+**错误代码**:
+```go
+// 字段
+peerLastIndex []int  // ❌ 同时用于 matchIndex（quorum）和 nextIndex-1（探测位置）
+
+// sendAppendEntries failure 路径
+rf.peerLastIndex[server] = reply.LastMatchIndex  // ❌ 降低了 matchIndex
+
+// startHeartbeat
+prevLogIndex := rf.peerLastIndex[i]  // ❌ 直接用 matchIndex 当 nextIndex-1
+```
+
+**问题**: Raft 论文 Figure 2 定义了两个独立的 per-peer 变量：
+
+- `matchIndex[i]`：已确认复制到 peer i 的最高 index，**只增**，用于 quorum commit 判断
+- `nextIndex[i]`：下次要发给 peer i 的 index，**可以降低**，用于快速回退
+
+合并成一个 `peerLastIndex` 后，failure 路径（`peerLastIndex = reply.LastMatchIndex`，可能为 0）会降低 matchIndex，导致已 committed 的 entry 在 quorum 统计中丢失计数，进而阻塞后续 commit——在持续高频写入 + 网络乱序下，每次 failure 回复都会让 leader 误以为 majority 减少。
+
+具体危害：
+1. `matchIndex` 被打回 0 → quorum 扫描时 matchCount 不足 → 本该 commit 的 entry 卡住
+2. 下轮心跳 `prevLogIndex = matchIndex = 0` → 整条 log 全部重发 → RPC 次数爆炸（TestCount3B 失败）
+3. 正确性边界：若所有 success 回复已确认 commitIndex，暂不影响已 commit 内容；但若 failure 打回发生在首次 commit 之前，会造成无限阻塞
+
+**正确做法**: 拆分为两个字段：
+```go
+matchIndex []int  // 已确认复制的最高 index，只增，用于 quorum
+nextIndex  []int  // 下次发送的起点，可降，用于确定 prevLogIndex
+```
+
+当选 leader 时初始化：
+```go
+for i := range rf.peers {
+    rf.matchIndex[i] = 0
+    rf.nextIndex[i] = rf.lastLogIndex() + 1
+}
+```
+
+success 路径（matchIndex 和 nextIndex 都向前推进）：
+```go
+rf.matchIndex[server] = max(rf.matchIndex[server], args.PrevLogIndex+len(args.Entries))
+rf.nextIndex[server] = rf.matchIndex[server] + 1
+```
+
+failure 路径（只修改 nextIndex，matchIndex 不变）：
+```go
+if args.PrevLogIndex < rf.matchIndex[server] {
+    return ok  // 乱序 stale failure，丢弃
+}
+rf.nextIndex[server] = reply.LastMatchIndex + 1
+```
+
+**核心 Raft 不变式**: matchIndex 单调递增，是已知事实；nextIndex 是乐观猜测，可以随 failure 回退。两者职责不同，不能共用一个变量。
+
+---
+
+### BUG-011 · AppendEntries 无条件截断日志，乱序 RPC 可抹掉已 committed 的 entry　`【High】` `【经典错误】`
+
+**文件**: `src/raft1/raft.go` — `AppendEntriesHandler`
+
+**错误代码**:
+```go
+if len(args.Entries) > 0 {
+    rf.logs = rf.logs[:rf.relIdx(args.PrevLogIndex)+1]  // ❌ 无条件截断
+    rf.logs = append(rf.logs, args.Entries...)
+    rf.persist()
+}
+```
+
+**问题**: labrpc longreordering 模式下，同一 term 内的 RPC 回复可延迟最多 2000ms，导致旧消息晚于新消息到达。典型时序：
+
+```
+Leader → Follower: AppendEntries(prevIdx=4, entries=[5,6])  ← 较新，先到
+  Follower: log 变成 [0..6]，entry 6 append 成功
+  Leader: majority 确认 entry 6，commitIndex = 6
+
+Leader → Follower: AppendEntries(prevIdx=4, entries=[5])    ← 较旧，后到
+  Follower: 无条件截断到 index 4，再 append [5]
+  → entry 6 被抹掉，但 leader 认为已 committed！
+```
+
+**根本原因**: 论文 §5.3 明确规定——只有 **term 冲突**（相同 index 但 term 不同）才能截断，相同 term 的相同 entry 绝对不能删除。当前实现违反了这一原则：只要 entries 非空，不管 term 是否一致都无条件截断。
+
+同样的问题出现在 InstallSnapshot 路径：如果 follower 在 snapshotIndex 处的 term 与 SnapshotTerm 一致，说明此后的 entry 也是一致的，不应全部丢弃。
+
+**正确做法**: 找到第一个冲突点，只从冲突点开始截断：
+```go
+if len(args.Entries) > 0 {
+    i := 0
+    for i < len(args.Entries) {
+        logIdx := args.PrevLogIndex + 1 + i
+        if logIdx > rf.lastLogIndex() {
+            break  // 超出范围，后面全是新的
+        }
+        if rf.logAt(logIdx).Term != args.Entries[i].Term {
+            break  // 找到冲突点
+        }
+        i++  // term 相同，已有且一致，跳过
+    }
+    if i < len(args.Entries) {
+        logIdx := args.PrevLogIndex + 1 + i
+        rf.logs = append(rf.logs[:rf.relIdx(logIdx)], args.Entries[i:]...)
+        rf.persist()
+    }
+    // i == len(args.Entries)：全部已存在且一致，无需操作
+}
+```
+
+**核心 Raft 不变式**: "If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it."（论文 §5.3）冲突的定义是 **term 不同**，term 相同则不是冲突，不得截断。
+
+---
+
+### BUG-012 · InstallSnapshot 保留尾部日志时未校验 term，导致分叉条目残留、follower 永久卡死　`【High】`
+
+**文件**: `src/raft1/raft.go` — `AppendEntriesHandler`（InstallSnapshot 分支）
+
+**错误代码**:
+```go
+logs := []LogEntry{{Term: args.SnapshotTerm}}
+if rf.relIdx(args.SnapshotIndex) < len(rf.logs) {
+    // ❌ 只判断长度，没校验 SnapshotIndex 处 term 是否一致
+    rf.logs = append(logs, rf.logs[rf.relIdx(args.SnapshotIndex)+1:]...)
+}
+rf.snapshotIndex = args.SnapshotIndex
+```
+
+**问题**: 保留 `SnapshotIndex` 之后的尾部条目时，只判断了 `relIdx < len`，没有检查 follower 在 `SnapshotIndex` 处的条目 term 是否等于 `SnapshotTerm`。若 follower 此处的日志来自**分叉历史**（同 index 不同 term），这些尾部条目本应丢弃却被保留，残留在快照之上，与 leader 的真实日志冲突。
+
+**永久卡死时序**: follower 残留分叉尾部后，leader 发 `AppendEntries(prevIdx=SnapshotIndex, prevTerm=正确)` 时一致性检查在尾部反复失配；回退又退到 `SnapshotIndex`，触发的 InstallSnapshot 因 `SnapshotIndex <= rf.snapshotIndex` 被当作 stale 直接 return success（不重建日志），于是 nextIndex 在 `SnapshotIndex+1` 与回退之间死循环，follower commit 永远停在 snapshotIndex。
+
+**正确做法**: 只有 follower 在 `SnapshotIndex` 处已有同 index 同 term 的条目时才保留尾部，否则丢弃整个 log：
+```go
+logs := []LogEntry{{Term: args.SnapshotTerm}}
+if rf.relIdx(args.SnapshotIndex) < len(rf.logs) &&
+    rf.logAt(args.SnapshotIndex).Term == args.SnapshotTerm {
+    rf.logs = append(logs, rf.logs[rf.relIdx(args.SnapshotIndex)+1:]...)
+} else {
+    rf.logs = logs
+}
+rf.snapshotIndex = args.SnapshotIndex
+```
+
+**核心 Raft 不变式**: 论文 Figure 13 规则 6——"If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply." 否则丢弃整个 log。term 是判定保留/丢弃的唯一依据，与 BUG-011（截断必须以 term 一致性为准）同源。
+
+---
