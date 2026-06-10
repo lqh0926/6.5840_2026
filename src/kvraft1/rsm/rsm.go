@@ -1,22 +1,24 @@
 package rsm
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
 
 type Op struct {
+	Opcommad interface{}
+	HashNum  int64
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -37,6 +39,8 @@ type RSM struct {
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
+	chMap        map[int]chan any
+	hashNumMap   map[int]int64
 	// Your definitions here.
 }
 
@@ -61,17 +65,19 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		chMap:        make(map[int]chan any),
+		hashNumMap:   make(map[int]int64),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.readApplyCh()
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -83,5 +89,61 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	_, rfIsLeader := rsm.rf.GetState()
+	if !rfIsLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+	rsm.mu.Lock()
+	ch := make(chan any, 1)
+	hashNum := rand.Int63()
+	op := Op{Opcommad: req, HashNum: hashNum}
+	logId, term, ok := rsm.rf.Start(op)
+	if !ok {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+	rsm.hashNumMap[logId] = hashNum
+	oldCh, ok := rsm.chMap[logId]
+	if ok {
+		close(oldCh)
+	}
+	rsm.chMap[logId] = ch
+	rsm.mu.Unlock()
+	for {
+		select {
+		case res, ok := <-ch:
+			if !ok {
+				return rpc.ErrWrongLeader, nil
+			}
+			return rpc.OK, res
+		case <-time.After(20 * time.Millisecond):
+			newTerm, rfIsLeader := rsm.rf.GetState()
+			if !rfIsLeader || newTerm != term {
+				return rpc.ErrWrongLeader, nil
+			}
+		}
+	}
+
+}
+
+func (rsm *RSM) readApplyCh() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			res := rsm.sm.DoOp(op.Opcommad)
+			rsm.mu.Lock()
+			hashNum, hasHash := rsm.hashNumMap[msg.CommandIndex]
+			ch, hasCh := rsm.chMap[msg.CommandIndex]
+			if hasCh {
+				if hasHash && hashNum == op.HashNum {
+					ch <- res
+				} else {
+					close(ch)
+				}
+			}
+			delete(rsm.hashNumMap, msg.CommandIndex)
+			delete(rsm.chMap, msg.CommandIndex)
+			rsm.mu.Unlock()
+		}
+	}
 }
