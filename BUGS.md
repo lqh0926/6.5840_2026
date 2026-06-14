@@ -4,6 +4,55 @@ Valuable bugs encountered during 6.5840 lab implementation. Careless/trivial omi
 
 ---
 
+## Lab 2 — Simple KV Server
+
+### BUG-L2-001 · Put 第一次 RPC 收到 ErrVersion 误返回 ErrMaybe，破坏线性一致语义　`【Medium】`
+
+**文件**: `src/kvsrv1/client.go` — `Clerk.Put`
+
+**错误代码**:
+```go
+ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+if ok {
+    if reply.Err == rpc.ErrVersion {
+        return rpc.ErrMaybe   // ❌ 第一次 RPC 就返回 ErrMaybe
+    }
+    return reply.Err
+}
+```
+
+**问题**: 关键区别在于 ErrVersion 是**第一次 RPC** 收到的，还是**重发（resend）** 收到的。
+
+第一次 RPC `ok == true` 说明请求-响应完整往返，服务器一定**没有**执行这次 Put（版本号不匹配被拒）。此时是 100% 确定的"没生效"，应如实返回 `ErrVersion`。若返回 `ErrMaybe`，就把一个"确定失败"误报成"可能成功"，破坏测试对线性一致性的预期。
+
+`ErrMaybe` 只能用于**重发路径**：第一次 RPC `ok == false`（请求或响应丢失），Clerk 无法区分两种情况——
+1. 第一次请求没到服务器 → 没生效 → 重发会成功；
+2. 第一次请求已到达并成功执行（版本号已 +1），只是响应丢了 → 重发因版本号已变而收到 `ErrVersion`，但 Put 其实**已经成功**。
+
+重发收到 ErrVersion 时无法分辨是 1 还是 2，所以只能返回 `ErrMaybe`（可能生效）。
+
+**正确做法**: 第一次 RPC 如实返回 `reply.Err`（含 ErrVersion）；只有进入重发循环后收到 ErrVersion 才转成 ErrMaybe：
+```go
+ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+if ok {
+    return reply.Err                 // ✅ 第一次：ErrVersion 确定没生效，照实返回
+}
+for {
+    ok = ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+    if ok {
+        if reply.Err == rpc.ErrVersion {
+            return rpc.ErrMaybe      // ✅ 重发：之前可能已生效
+        }
+        return reply.Err
+    }
+    time.Sleep(100 * time.Millisecond)
+}
+```
+
+**核心不变式**: ErrVersion 来自第一次往返成功的 RPC → 确定没生效 → `ErrVersion`；来自重发 → 之前可能已生效 → `ErrMaybe`。区分依据是"是否为重发"，不是"是否收到 ErrVersion"。
+
+---
+
 ## Lab 3 — Raft
 
 ### BUG-001 · voteFor 在同 term 内被错误重置导致 split-brain　`【High】`
@@ -452,5 +501,160 @@ rf.snapshotIndex = args.SnapshotIndex
 ```
 
 **核心 Raft 不变式**: 论文 Figure 13 规则 6——"If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply." 否则丢弃整个 log。term 是判定保留/丢弃的唯一依据，与 BUG-011（截断必须以 term 一致性为准）同源。
+
+---
+
+## Lab 4 — Fault-tolerant KV
+
+> 本节多为**设计阶段讨论结论**与 **2026 版 vs 2024 版差异**梳理，非运行期崩溃型 bug，但都是极易绕进去的理解陷阱。
+
+### 2026 版 vs 2024 版核心差异（必须先理解，否则后面全错）
+
+| 维度 | 2024 版（旧 6.824） | 2026 版（本仓库） |
+|---|---|---|
+| 写语义 | 无条件 `Put` / `Append` | 带 `version` 的 **conditional Put（CAS）**：version 匹配才执行，执行后 version+1 |
+| 重复写防护 | **clientId+seq 去重表**，apply 前查表跳过重复 | **version 天然幂等**：重发的 Put 因 version 已变而被 `ErrVersion` 挡住，不会执行第二次 |
+| 去重表持久化 | 必须把 `clientId→seqMax` 一起写进快照 | **没有去重表**，无需持久化任何 client 状态 |
+| 不确定结果 | 去重表实现 exactly-once，client 直接拿真实结果 | client 自己合成 `ErrMaybe`，把"可能执行了"暴露给应用层 |
+| 快照内容 | KV 数据 + 去重表 | **仅 KV 数据（含 version）** |
+
+**一句话**：2026 版用 **version（CAS）替代了 clientId+seq 去重表**。version 本身就存在 KV 数据里，会随快照一起持久化，所以幂等性"免费"获得，不再需要任何独立去重结构。
+
+**但这套"免费"是有代价的**——version 只能为**幂等操作**提供 exactly-once *效果*，对**非幂等的 Append 无法归因**，这正是 `ErrMaybe` 存在的根本原因。这是理解整个 2026 设计取舍的核心，详见 BUG-L4-004。
+
+---
+
+### BUG-L4-001 · 把 rsm 的 HashNum 随机数误当成去重机制　`【概念】`
+
+**文件**: `src/kvraft1/rsm/rsm.go` — `Submit` / `readApplyCh`
+
+**误解**: 以为 `Op.HashNum`（`hashNumMap[logId]` + apply 时比对）是"客户端去重"，因此担心快照丢掉它会导致去重失效、重复执行。
+
+**真相**: `HashNum` 与去重**毫无关系**，它解决的是 Raft KV 的经典问题——
+
+- leader 调 `rf.Start(op)` 拿到 index i，在 `Submit` 里等 `chMap[i]`；
+- 若该 leader 失去 leadership，index i 可能被**别人的命令**覆盖；
+- apply 到 index i 时比对 `applied.HashNum == 我记录的 hashNum`，不等说明"这个槽位不是我的命令" → 返回 `ErrWrongLeader`。
+
+它是 **leader 进程内、单次 RPC 生命周期**的"apply 匹配标记"，apply 完即 `delete`。**纯内存瞬态，不进快照、也不该进快照**：重启后没有任何在途 `Submit` 在等旧 channel，这个信息天生无意义。
+
+| | HashNum（rsm 层） | clientId+seq 去重表（2024 版） |
+|---|---|---|
+| 解决 | "index i 回来的是不是我提交的 op" | "这个请求是否已执行过" |
+| 存活 | 内存瞬态，用完即弃 | 需随状态机持久化/快照 |
+| 2026 版 | 保留（仍需要） | **不存在** |
+
+**核心**：apply 匹配（HashNum）与重复请求去重（version）是两个正交层面，别混为一谈。
+
+---
+
+### BUG-L4-002 · ErrWrongLeader 统一表示"未 commit"，client 重试安全　`【设计】`
+
+**文件**: `src/kvraft1/rsm/rsm.go` — `Submit`
+
+从 client 视角只有两类结果：
+
+1. 命令**真正 commit + apply** → 拿到真实结果（`OK` / `ErrVersion` / `ErrNoKey`）；
+2. 命令**没能 commit**（不是 leader / 失去 leadership / index 被占用 / 超时）→ 一律 `ErrWrongLeader`，让 client 换 server 重试。
+
+`Submit` 把 not-leader、`Start` 失败、term 变化、index 被别人占用（`close(ch)`）全部归为 `ErrWrongLeader` 是正确的。重试安全因为：Get 幂等、Put 由 version 保证幂等。
+
+**关键陷阱（时序题）**：A 收到 Put 后 `Start`、随即离线 → 这条 log 可能已被别的 leader commit 并快照。A 恢复后收到的是 InstallSnapshot 而非 CommandValid，等待的 channel 永远不来 signal。**但 `Submit` 不会卡死**——它的 `time.After` + `GetState()` 兜底发现 `term 变了 / 非 leader`，20ms 内返回 `ErrWrongLeader`。**这条路径根本不依赖 HashNum，靠的是 term 检查。**
+
+**核心不变式**：「等待的 log 被快照跳过」与「我仍是原 term 的 leader」**互斥**——一个节点只会通过 InstallSnapshot 跳过它"已非 leader / 已非原 term"的 log；它作为 leader Start 且正在等的 log，要么本地正常 apply（log 一定先 apply 再被压进快照），要么早已 stepDown 被 term 检查兜底。所以 HashNum 被快照丢弃永不造成误判。
+
+---
+
+### BUG-L4-003 · ErrMaybe 是 Clerk 合成的；Clerk 不能把 ErrWrongLeader 当终态　`【High】`
+
+**文件**: `src/kvraft1/client.go` — `Clerk.Put` / `Clerk.Get`
+
+`rpc` 包注释明确：`ErrMaybe` 是 **"Err returned by Clerk only"**——server 永远不返回它，由 Clerk 在重试循环里把 `ErrVersion` 转成 `ErrMaybe`。
+
+**错误代码**:
+```go
+ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Put", &args, &reply)
+if ok {
+    return reply.Err   // ❌ ok 但 reply.Err==ErrWrongLeader 时，把"未 commit"当终态抛给应用层
+}
+```
+
+**问题**: `ErrWrongLeader` 不是终态，是"换 server 重试"的信号。直接返回它既错误，又破坏了 first/resend 语义。
+
+**ErrVersion → ErrVersion 还是 ErrMaybe 的判据**：
+
+- **第一个干净返回（非 WrongLeader、非超时）就拿到 ErrVersion** → 返回 `ErrVersion`（server 真做了版本检查，确定没改）；
+- **经历过 WrongLeader / 超时之后再拿到 ErrVersion** → 返回 `ErrMaybe`。因为那个 WrongLeader 可能是"server 已 `Start`、log 其实已 commit、只是它失去了 leadership"，client 无从区分"立即拒绝（没执行）"和"已执行但响应丢失"，必须保守。
+
+**正确范式**:
+```go
+func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
+    args := rpc.PutArgs{Key: key, Value: value, Version: version}
+    first := true
+    for {
+        var reply rpc.PutReply
+        ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Put", &args, &reply)
+        if ok && reply.Err != rpc.ErrWrongLeader {     // ✅ 只有非 WrongLeader 才是真实结果
+            if !first && reply.Err == rpc.ErrVersion {
+                return rpc.ErrMaybe                     // ✅ resend 的 ErrVersion → 可能已执行
+            }
+            return reply.Err
+        }
+        first = false                                  // WrongLeader / 超时都消耗 first
+        ck.leader = (ck.leader + 1) % len(ck.servers)  // ✅ 换 leader 重试
+        if !ok {
+            time.Sleep(100 * time.Millisecond)
+        }
+    }
+}
+```
+
+**连带 bug**：① 原代码用 `ck.server`（字段不存在，编译不过，应为 `ck.servers[ck.leader]`）；② `Get` 用 `for !ok` 循环，WrongLeader 时 `ok==true` 会错误退出循环并返回假的 `ErrNoKey`，应改为 `for {}` 仅在拿到真实结果时 return。
+
+**核心不变式**: 判定 ErrVersion vs ErrMaybe 的依据是「**这是不是对该 Put 的第一个、且干净返回的 RPC**」，不是「是否收到 ErrVersion」。一旦出现过任何"不确定"（WrongLeader / 超时），后续 ErrVersion 一律 ErrMaybe。与 [[BUG-L2-001]]（kvsrv 单机版的同一判据）同源，只是多了 WrongLeader 这个"不确定来源"。
+
+---
+
+### BUG-L4-004 · version 去重的本质局限：只能去重幂等操作，对非幂等 Append 无法归因（ErrMaybe 的根源）　`【核心】`
+
+**这是 2026 vs 2024 在语义上的根本取舍，前面几条都是它的推论。**
+
+**version 去重的粒度是"key 的状态版本"，而不是"哪个 client 的哪次请求"。** 它能保证的只有一件事：**对一个特定 `(value, version=N)` 的写，最多生效一次**——因为成功一次后 version 就变成 N+1，同一个写再来会被 `ErrVersion` 挡掉。
+
+- **对幂等操作（覆盖式 Put）**：重复执行结果一样，所以"最多生效一次"等价于 exactly-once *效果*，version 机制够用。
+- **对非幂等操作（Append = `Get` 拿 (v, ver) → `Put(v+delta, ver)` 的 CAS 循环）**：version 机制**做不到归因**。
+
+**归因问题（你说的"确实做了但不知道谁做的"）**：
+
+单个 client C 做 append：
+```
+C: Get → version=5
+C: Put(newval, version=5) → server 执行成功，version 5→6，但响应丢失
+C: 超时重试 Put(newval, version=5) → 现在 version=6，返回 ErrVersion
+```
+
+C 看到 ErrVersion，只知道"version 已经不是 5 了"，但**无法回答"5→6 这一步是不是我这次请求造成的"**：
+
+- 情况 (a)：是我上次成功了 → 我**不能**再 append 一次（否则 append 两遍）；
+- 情况 (b)：是别人在我俩之间改的，我上次根本没成功 → 我**应该**基于新 version 重新 append。
+
+version 只记录"状态变了"，不记录"谁把它改成这样的"，所以 (a)(b) 无法区分。client 只能把不确定性甩给应用层 → 返回 **`ErrMaybe`**。**这就是 ErrMaybe 的根源，也是 version 方案对非幂等操作的语义降级：从 exactly-once 退化为 at-most-once + "可能做了"。**
+
+**对比 2024 版为什么能做到（含 Append 的真 exactly-once）**：
+
+clientId+seq 去重表是**按请求归因**的——它记录"client C 的 seq=N 这个请求执行过没有、结果是什么"。重发时直接查表**返回缓存结果**，于是：
+
+- 即便是非幂等的 Append，也精确知道"这个请求执行过了，结果是 X"，不重复执行；
+- 不需要 ErrMaybe，因为"谁的哪次请求做没做"被去重表精确记录了。
+
+| | 2026 version（CAS） | 2024 clientId+seq 去重表 |
+|---|---|---|
+| 去重粒度 | key 的状态版本 | (clientId, seq) 请求 |
+| 幂等操作 | exactly-once 效果 ✓ | exactly-once ✓ |
+| 非幂等 Append | **无法归因 → at-most-once + ErrMaybe** | 缓存结果 → 真 exactly-once ✓ |
+| 重发的处理 | 看 version 变没变（猜） | 查表返回缓存结果（确定） |
+| 代价 | 无去重表、无需持久化 client 状态；语义弱 | 需维护+持久化去重表；语义强 |
+
+**核心不变式**: version 去重的能力边界 = 操作是否幂等。它把"是否重复执行"判断**外包给了 key 的版本状态**，因此只能服务"重复无害"的幂等写；非幂等写的 exactly-once 必须由更高层（按请求归因的去重表，或应用层自己的 version+重试逻辑）承担，而 2026 版选择了后者并以 `ErrMaybe` 暴露不确定性。与 [[BUG-L4-003]]（ErrMaybe 何时返回）互为表里：L4-003 讲"何时合成 ErrMaybe"，L4-004 讲"为什么不得不有 ErrMaybe"。
 
 ---

@@ -68,9 +68,10 @@ type Raft struct {
 	matchIndex []int // matchIndex[i]: highest log index confirmed replicated on peer i (only increases)
 	nextIndex  []int // nextIndex[i]:  next log index to send to peer i (can decrease on failure)
 
-	resetCh   chan struct{}
-	applyCh   chan raftapi.ApplyMsg
-	applyCond *sync.Cond
+	resetCh    chan struct{}
+	newEntryCh chan struct{} // signal from Start() to heartbeat goroutine: replicate immediately
+	applyCh    chan raftapi.ApplyMsg
+	applyCond  *sync.Cond
 }
 
 // --- Log index helpers ---
@@ -407,6 +408,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := rf.lastLogIndex() + 1
 	rf.logs = append(rf.logs, LogEntry{Command: command, Term: rf.term})
 	rf.persist()
+	// Signal heartbeat goroutine to replicate immediately instead of waiting
+	// for the next 100ms tick.
+	select {
+	case rf.newEntryCh <- struct{}{}:
+	default:
+	}
 	return index, rf.term, true
 }
 
@@ -492,7 +499,12 @@ func (rf *Raft) startHeartbeat() {
 			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-rf.newEntryCh:
+			timer.Stop()
+		case <-timer.C:
+		}
 	}
 }
 
@@ -576,6 +588,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.snapshot = persister.ReadSnapshot()
 
 	rf.resetCh = make(chan struct{}, 1)
+	rf.newEntryCh = make(chan struct{}, 1)
 	rf.applyCond = sync.NewCond(&rf.mu)
 	// After crash-recovery, appliedIndex and commitIndex start at snapshotIndex;
 	// the service layer restores application state from the snapshot directly.

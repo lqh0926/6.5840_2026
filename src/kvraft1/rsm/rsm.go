@@ -109,6 +109,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	}
 	rsm.chMap[logId] = ch
 	rsm.mu.Unlock()
+	overallTimeout := time.After(1 * time.Second)
 	for {
 		select {
 		case res, ok := <-ch:
@@ -121,6 +122,8 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 			if !rfIsLeader || newTerm != term {
 				return rpc.ErrWrongLeader, nil
 			}
+		case <-overallTimeout:
+			return rpc.ErrWrongLeader, nil
 		}
 	}
 
