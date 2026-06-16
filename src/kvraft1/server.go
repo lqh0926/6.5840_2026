@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
@@ -9,8 +11,8 @@ import (
 )
 
 type kvEntry struct {
-	value   string
-	version rpc.Tversion
+	Value   string
+	Version rpc.Tversion
 }
 
 type KVServer struct {
@@ -18,6 +20,10 @@ type KVServer struct {
 	rsm   *rsm.RSM
 	kvMap map[string]kvEntry
 	// Your definitions here.
+}
+
+type Snapshot struct {
+	KvMap map[string]kvEntry
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -41,8 +47,8 @@ func (kv *KVServer) DoGet(args rpc.GetArgs) rpc.GetReply {
 	value, ok := kv.kvMap[args.Key]
 	var reply rpc.GetReply
 	if ok {
-		reply.Value = value.value
-		reply.Version = value.version
+		reply.Value = value.Value
+		reply.Version = value.Version
 		reply.Err = rpc.OK
 	} else {
 		reply.Err = rpc.ErrNoKey
@@ -55,15 +61,15 @@ func (kv *KVServer) DoPut(args rpc.PutArgs) rpc.PutReply {
 	value, ok := kv.kvMap[args.Key]
 	reply := rpc.PutReply{}
 	if ok {
-		if args.Version == value.version {
-			kv.kvMap[args.Key] = kvEntry{value: args.Value, version: value.version + 1}
+		if args.Version == value.Version {
+			kv.kvMap[args.Key] = kvEntry{Value: args.Value, Version: value.Version + 1}
 			reply.Err = rpc.OK
 		} else {
 			reply.Err = rpc.ErrVersion
 		}
 	} else {
 		if args.Version == 0 {
-			kv.kvMap[args.Key] = kvEntry{value: args.Value, version: 1}
+			kv.kvMap[args.Key] = kvEntry{Value: args.Value, Version: 1}
 			reply.Err = rpc.OK
 		} else {
 			reply.Err = rpc.ErrNoKey
@@ -74,11 +80,26 @@ func (kv *KVServer) DoPut(args rpc.PutArgs) rpc.PutReply {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	// You can use labgob to turn a Snapshot struct into a byte array.
+	snapshot := Snapshot{KvMap: kv.kvMap}
+	buf := new(bytes.Buffer)
+	w := labgob.NewEncoder(buf)
+	if err := w.Encode(snapshot); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	// You can use labgob to turn a byte array into a Snapshot struct.
+	buf := bytes.NewBuffer(data)
+	r := labgob.NewDecoder(buf)
+	var snapshot Snapshot
+	if err := r.Decode(&snapshot); err != nil {
+		panic(err)
+	}
+	kv.kvMap = snapshot.KvMap
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -114,12 +135,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(kvEntry{})
+	labgob.Register(Snapshot{})
 
 	kv := &KVServer{me: me}
 	kv.kvMap = make(map[string]kvEntry)
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
+	if persister.SnapshotSize() > 0 {
+		kv.Restore(persister.ReadSnapshot())
+	}
 	return []any{kv, kv.rsm.Raft()}
 }
 

@@ -120,9 +120,17 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		case <-time.After(20 * time.Millisecond):
 			newTerm, rfIsLeader := rsm.rf.GetState()
 			if !rfIsLeader || newTerm != term {
+				rsm.mu.Lock()
+				delete(rsm.chMap, logId)
+				delete(rsm.hashNumMap, logId)
+				rsm.mu.Unlock()
 				return rpc.ErrWrongLeader, nil
 			}
 		case <-overallTimeout:
+			rsm.mu.Lock()
+			delete(rsm.chMap, logId)
+			delete(rsm.hashNumMap, logId)
+			rsm.mu.Unlock()
 			return rpc.ErrWrongLeader, nil
 		}
 	}
@@ -147,6 +155,12 @@ func (rsm *RSM) readApplyCh() {
 			delete(rsm.hashNumMap, msg.CommandIndex)
 			delete(rsm.chMap, msg.CommandIndex)
 			rsm.mu.Unlock()
+			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > rsm.maxraftstate {
+				snapshot := rsm.sm.Snapshot()
+				rsm.rf.Snapshot(msg.CommandIndex, snapshot)
+			}
+		} else if msg.SnapshotValid {
+			rsm.sm.Restore(msg.Snapshot)
 		}
 	}
 }

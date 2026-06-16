@@ -468,6 +468,10 @@ if len(args.Entries) > 0 {
 
 **核心 Raft 不变式**: "If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it."（论文 §5.3）冲突的定义是 **term 不同**，term 相同则不是冲突，不得截断。
 
+**落地备注 (2026-06-14)**: 当初只有 InstallSnapshot 路径（BUG-012）按此原则改了，普通 AppendEntries 路径（`raft.go` 第 297 行附近）仍是 `rf.logs = append(rf.logs[:relIdx(PrevLogIndex)+1], args.Entries...)` 的无条件截断 —— 文档写了正确做法但源码这一行漏改。lab4c 偶发的 `Snapshot index N out of bounds (last log index N-1)` 即由此引起：迟到的短 AE 抹掉已 committed 的尾部 entry，rsm 随后对该 index 调 `rf.Snapshot` 越界 Fatal。现已统一为逐条找冲突点截断，8 轮 `-race` 压测 TestSnapshotUnreliableRecoverConcurrentPartition* 全过。
+
+**同根因的第二张脸 (2026-06-16)**: 回归压测期间还出现过 `commitIndex > lastLogIndex` 的 slice 越界 panic（`sendApplyMsg` 中 `rf.logs[relIdx(startIdx):relIdx(commitIndex)+1]`）。与 `Snapshot out of bounds` **同一个根因**：无条件截断把日志砍到 commit 水位线以下，而迟到那条短 AE 的 `LeaderCommit` 比当前 commit 小、进不了 commit 推进分支，于是 commitIndex 停在原处、日志却变短 → apply 时越界。修复（只在 term 冲突点截断、已匹配尾部一律保留）同时根除两个 panic。曾因 `go test` 不重建 daemon 子进程（见笔记 daemon_test_rebuild）反复复现失败、临时 DIAG 探针不触发，误判为缓存假象；改用 `make RUN=... raft1/kvraft1`（`.FORCE` 重建 daemon + `-race`）后，50 轮 + 1 轮共 51 轮 3A/3B/3C/3D/4B/4C 全过，DIAG 当门哨零触发，确认根除。临时 DIAG 插桩已于本日删除。
+
 ---
 
 ### BUG-012 · InstallSnapshot 保留尾部日志时未校验 term，导致分叉条目残留、follower 永久卡死　`【High】`

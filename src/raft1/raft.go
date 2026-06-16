@@ -289,8 +289,25 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntries, reply *AppendEntriesRe
 	reply.Term = rf.term
 	reply.Success = true
 	if len(args.Entries) > 0 {
-		rf.logs = append(rf.logs[:rf.relIdx(args.PrevLogIndex)+1], args.Entries...)
-		rf.persist()
+		// 只在 term 冲突处截断：找到第一个与本地不一致的条目再截断并追加。
+		// 无条件截断会被 longreordering 下迟到的短 AE 抹掉已 committed 的尾部。
+		i := 0
+		for i < len(args.Entries) {
+			logIdx := args.PrevLogIndex + 1 + i
+			if logIdx > rf.lastLogIndex() {
+				break // 超出范围，后面全是新的
+			}
+			if rf.logAt(logIdx).Term != args.Entries[i].Term {
+				break // 找到冲突点
+			}
+			i++ // term 相同，已有且一致，跳过
+		}
+		if i < len(args.Entries) {
+			logIdx := args.PrevLogIndex + 1 + i
+			rf.logs = append(rf.logs[:rf.relIdx(logIdx)], args.Entries[i:]...)
+			rf.persist()
+		}
+		// i == len(args.Entries)：全部已存在且一致，无需操作
 	}
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
