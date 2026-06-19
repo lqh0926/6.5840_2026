@@ -1,0 +1,26 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Raft 3A (race)",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}/src/raft1",
+            "args": ["-test.v", "-test.run", "3A", "-test.timeout", "120s"],
+            "buildFlags": "-race",
+            "env": {},
+            "preLaunchTask": "build-raft1d-race"
+        },
+        {
+            "name": "Raft 3A (no race)",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}/src/raft1",
+            "args": ["-test.v", "-test.run", "3A", "-test.timeout", "120s"],
+            "env": {},
+            "preLaunchTask": "build-raft1d-race"
+        }
+    ]
+}
