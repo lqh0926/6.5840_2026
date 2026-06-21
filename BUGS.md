@@ -662,3 +662,303 @@ clientId+seq 去重表是**按请求归因**的——它记录"client C 的 seq=
 **核心不变式**: version 去重的能力边界 = 操作是否幂等。它把"是否重复执行"判断**外包给了 key 的版本状态**，因此只能服务"重复无害"的幂等写；非幂等写的 exactly-once 必须由更高层（按请求归因的去重表，或应用层自己的 version+重试逻辑）承担，而 2026 版选择了后者并以 `ErrMaybe` 暴露不确定性。与 [[BUG-L4-003]]（ErrMaybe 何时返回）互为表里：L4-003 讲"何时合成 ErrMaybe"，L4-004 讲"为什么不得不有 ErrMaybe"。
 
 ---
+
+## Lab 5 — Sharded KV
+
+> 本节为**实现前设计讨论**的总结，均为概念/架构层面的理解陷阱，非运行期崩溃。但每一条都直接决定代码怎么写，绕进去就会写错。
+
+### 三层 Clerk 架构（理清谁打谁）`【架构】`
+
+```
+                    测试 ts.MakeClerk()
+                            │
+                            ▼
+              ┌─────────────────────────────┐
+              │  shardkv.Clerk (顶层路由)    │   ← src/shardkv1/client.go
+              │  - Get/Put 实现              │
+              │   - sck  : *ShardCtrler     │
+              │   - rcks : map[gid]->grpCk   │
+              │   - cfg  : *ShardConfig     │
+              └─────────────┬───────────────┘
+                            │
+              ┌─────────────┴────────────────────────┐
+              │ (1) sck.Query() 查配置                 │ (2) 找到 key 所属组的 gid
+              ▼                                       ▼
+   ┌──────────────────────────┐          ┌─────────────────────────────────┐
+   │ ShardCtrler (分片控制器)  │          │  shardgrp.Clerk (per-group)      │ ← src/shardkv1/shardgrp/client.go
+   │ - IKVClerk = kvsrv.Clerk │          │  - Get/Put 直接打到一个 Raft 组   │
+   │ - 把 config 当字符串存    │          │  - Freeze/Install/Delete 分片迁移 │
+   └────────────┬─────────────┘          └──────────────┬──────────────────┘
+                │                                       │ RPC
+                ▼                                       ▼
+   ┌──────────────────────────┐          ┌─────────────────────────────────┐
+   │ kvsrv (GRP0, 单机)       │          │  shardgrp KVServer (Raft 组)     │
+   │ - 只存一份 config 字符串   │          │  - 真正存用户的 key/value         │
+   │ - "first" -> config json │          │  - 用 Raft 复制 + RSM             │
+   └──────────────────────────┘          └─────────────────────────────────┘
+```
+
+**容易混淆的点**：`shardctrler.go:27` 的 `sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)` 是**控制器**用来读写配置字符串的 client，**不是**用户数据路径。用户数据路径是 `shardkv.Clerk` → `shardgrp.Clerk` → shardgrp KVServer（Raft 组）。两条路径缺一不可，但分别服务不同目的。
+
+**RSM 不复制，直接 import 复用**：`shardgrp/server.go` 已经 `import "6.5840/kvraft1/rsm"`，`KVServer` 结构里有 `rsm *rsm.RSM` 字段。RSM 通过 `StateMachine` 接口（`DoOp`/`Snapshot`/`Restore`）与具体业务解耦，kvraft 和 shardgrp 只是同一接口的两个实现。
+
+---
+
+### BUG-L5-001 · shardkv.Clerk 路由策略：缓存 cfg + ErrWrongGroup 刷新，不是每次 query　`【设计】`
+
+**文件**: `src/shardkv1/client.go` — `Clerk.Get` / `Clerk.Put`
+
+**关键发现**：
+- `GetArgs`/`PutArgs` **不带 config num 字段** — server 无法从请求里知道 client 用的是哪份配置
+- `ErrWrongGroup` 在整个代码库里**只有声明，从不被引用** — 它是留给 Lab 5 的占位符，要由我们实现去用
+- `TestDeleteBasic5A`（shardkv_test.go:120-154）明确检查迁移后 gid1+gid2 的 snapshot 总大小，**迁移后 gid1 必须删掉迁出的 shard** — client 不能假设 "gid1 上还留着旧数据兜底"
+
+**正确做法**：缓存 cfg，遇 `ErrWrongGroup` 刷新重试：
+```go
+func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
+    shard := shardcfg.Key2Shard(key)
+    for {
+        if ck.cfg == nil {
+            ck.cfg = ck.sck.Query()
+        }
+        gid := ck.cfg.Shards[shard]
+        rck := ck.getOrCreateGrpClerk(gid, ck.cfg.Groups[gid])
+        v, ver, err := rck.Get(key)
+        if err == rpc.ErrWrongGroup {
+            ck.cfg = nil   // 缓存过期，刷新
+            continue
+        }
+        return v, ver, err
+    }
+}
+```
+
+**为什么不是每次 query**：配置变更频率远低于 Get/Put 频率；`sck.Query()` 本身要走一次 kvsrv 的 RPC 往返。线性化测试（`TestManyConcurrentClerkReliable5A`，20 秒、10 个并发 clerk）每次 Get 都查配置会严重拖慢。
+
+**为什么不能只靠 ErrNoKey 刷新**：ErrNoKey 是合法的业务结果（key 真的不存在），刷新配置再试还是 ErrNoKey，会陷入死循环。必须有独立的"配置过期"信号，这就是 `ErrWrongGroup` 的用途。
+
+**核心不变式**: client 的 cfg 是"猜测"，server 跟踪的 config 才是"事实"。猜测错了会被 `ErrWrongGroup` 打回，刷新重试。系统对 client 之间 cfg 一致性要求最弱 — 每个最终看到正确 cfg 即可，快慢无所谓。
+
+---
+
+### BUG-L5-002 · shardgrp.Clerk 按 gid lazy 缓存，不每次 query 全 make　`【设计】`
+
+**文件**: `src/shardkv1/client.go` — `Clerk.getOrCreateGrpClerk`
+
+**骨架已经表态**：`rcks map[tester.Tgid]*shardgrp.Clerk` 字段 + `GetClerk(gid)` 接口 = 作者希望你按 gid 缓存。
+
+**为什么不能每次 query 全 make**：
+1. `shardgrp.Clerk` 有 `leader int` 字段 — 记着上次成功的 leader 索引，下次直接打那个 server，省掉一轮 ErrWrongLeader 往返。每次 make 新 clerk 就把 leader 缓存丢了
+2. 一次 Get 只用一个 gid — `cfg.Groups` 可能返回 8 个组，但当前 key 只属于 1 个 shard → 1 个 gid。给其他 7 个组 make clerk 是纯浪费
+3. 并发测试性能 — `TestManyConcurrentClerkReliable5A` 跑 20 秒、10 个 clerk 并发，每次 query 都重建 map 会显著拖慢
+
+**正确做法**：
+```go
+func (ck *Clerk) getOrCreateGrpClerk(gid tester.Tgid, servers []string) *shardgrp.Clerk {
+    if rck, ok := ck.rcks[gid]; ok {
+        return rck                      // 缓存命中，复用 leader 信息
+    }
+    rck := shardgrp.MakeClerk(ck.clnt, servers)
+    ck.rcks[gid] = rck
+    return rck
+}
+```
+
+**核心原则**: query 是按需（缓存过期/nil 时才查），make 也是按需（每个 gid 第一次见到才 make）。`*tester.Clnt` 是嵌入而不是字段，Clerk 调用方式是 `ck.Call(...)` 而非 `ck.clnt.Call(...)`。
+
+---
+
+### BUG-L5-003 · 配置变更用 push：controller 同步驱动迁移　`【设计】`
+
+**文件**: `src/shardkv1/shardctrler/shardctrler.go`
+
+**官方设计（lab5.md L17/122/128）就是 push**：controller 的 `ChangeConfigTo` 是同步阻塞调用，亲自驱动整个迁移——读当前配置 → 对每个换手的分片依次 `FreezeShard`(源) → `InstallShard`(目标) → `DeleteShard`(源) → 最后把新配置发布到 kvsrv。shardgrp 只被动响应这三个 RPC，**没有常驻轮询 goroutine**。
+
+**曾考虑过 pull（让 gaining group 轮询配置自驱），当时列的五点顾虑其实 push 都能解决**：
+
+1. **Controller 是临时的** — `ChangeConfigTo` 同步阻塞，迁移没做完不返回，期间实例一直存活；崩溃后的恢复由 Part B 的 current/next 双配置 + `InitController` 重做迁移完成（用 Num 幂等）。不存在"push 完进程就死"的问题。
+2. **多 Controller 并发** — 用带版本的 Put 对 next 配置做 CAS，同一 Num 只有一个 controller 发布成功；所有 shardgrp RPC 用 `Num` fencing，落败/重复的 controller 发的旧 RPC 被 shardgrp 直接忽略。
+3. **"等结果"不用轮询** — Freeze/Install/Delete 是同步 RPC，经 rsm 提交并返回 `OK` 就代表该步在目标组已落地，controller 直接知道完成，无需 poll 消费者状态。
+4. **通讯录自带** — controller 从 `cfg.Groups[gid]` 拿到各组 server 列表，`shardgrp.MakeClerk(sck.clnt, servers)` 建 clerk 发 RPC，不需要预先配置地址。
+5. **故障恢复集中在 controller** — controller 挂在迁移中途，新 controller 的 `InitController` 看到 next.Num > current.Num 就重跑该迁移；每步带 Num 幂等，已装的跳过、没装的补上，数据不丢。状态不必散在消费者本地。
+
+**核心原则**: controller 是**唯一的同步驱动者**；shardgrp 用 `cfg.Num` 单调比较防过期 RPC + 三步各自走 rsm 保证组内 3 副本一致。换来无轮询、无消费者状态机、恢复逻辑集中——代价只是 `ChangeConfigTo` 在迁移期间阻塞。
+
+---
+
+### BUG-L5-004 · 迁移协议：controller 驱动 Freeze→Install→Delete　`【设计】`
+
+**文件**: `src/shardkv1/shardctrler/shardctrler.go`、`src/shardkv1/shardgrp/server.go`、`src/shardkv1/shardgrp/shardrpc/shardrpc.go`
+
+**方向**（controller 在 `ChangeConfigTo` 里同步驱动；S 从 gid1 迁到 gid2）：
+```
+controller (ChangeConfigTo 同步驱动)
+  │ ① FreezeShard(S, num=2)  ─────→  gid1(源): 标记 S 冻结, 返回 S 的 KV 数据
+  │ ←─────────── State []byte ──────
+  │
+  │ ② InstallShard(S, state, num=2) ─→ gid2(目标): 提交到 gid2 的 Raft, 装入并立即服务
+  │
+  │ ③ DeleteShard(S, num=2)  ─────→  gid1(源): 删 S 的 KV 数据
+```
+
+- **Freeze**：controller → gid1，返回**源组上属于 shard S 的 KV 数据**（不是整个 kvMap，只是 `Key2Shard(key) == S` 的那些 key）
+- **Install**：controller → gid2，gid2 的 handler 走 `rsm.Submit` 提交到自己的 Raft
+- **Delete**：controller → gid1
+
+**为什么是 Freeze→Install→Delete 顺序**：删数据必须是最后一步，且必须在 Install 成功之后。否则源组先删、目标组还没装好就会丢数据。即使中途 RPC 丢或 controller 崩溃，重试（或 Part B 的新 controller）用 `num` 去重：已装过的 Install 跳过、直接补发 DeleteShard，数据不丢。
+
+**controller 给各组发 RPC 的地址来自 `cfg.Groups[gid]`** — config 自带通讯录，controller 不需要预先"知道某组在哪"。
+
+**单一驱动者，无"哪个副本发起"问题**：controller 是组外的唯一驱动者，不存在 3 副本各自发 RPC 的竞争。三个 handler 都走 `rsm.Submit`，由对应 group 的 leader 提交、3 副本经 Raft 一致 apply。
+
+**核心不变式**: 每步都带 `cfg.Num` 做幂等，重复 RPC、controller 重试/换主都能安全处理。Freeze/Install/Delete 三步各自是 Raft op（提交到对应 group 的 Raft 日志），确保组内 3 副本对 shardState 一致。
+
+---
+
+### BUG-L5-005 · 谁负责服务：shardState 三态 + Install 立即服务（不死锁）　`【设计】`
+
+**文件**: `src/shardkv1/shardgrp/server.go` — `DoOp` / `DoGet` / `DoPut`
+
+**核心争议**：Install 之后是立即服务（`Normal`），还是等 Delete 成功后才服务？
+
+**Delete 才服务的死锁风险**：
+```
+协议: Freeze → Install (不服务, 等 Delete) → Delete (controller 发给 gid1) → gid2 才服务
+死锁场景: gid1 在 Install 之后挂了 → Delete RPC 永远打不通 → gid2 永远不 Activate → shard 永久不可用
+```
+
+**Install 立即服务避免死锁**：
+```
+gid1:  Normal → Frozen → Gone
+gid2:  Absent → Normal   ← Install apply 后立即 Normal，不需中间态
+```
+
+gid2 激活只取决于自己 Raft 把 InstallOp apply 成功，**不依赖 Delete 这步**。gid1 挂了，controller 的 InstallShard 一旦在 gid2 落地，gid2 就开始服务。DeleteShard 是 best-effort，由 controller（或 Part B 新 controller）重试，不影响 gid2 服务。
+
+| 协议 | gid2 激活依赖 | gid1 挂了会怎样 |
+|---|---|---|
+| Delete 才服务 | gid1 DeleteShard reply | ❌ gid2 永远不 Activate，死锁 |
+| Install 立即服务 | 自己 Raft apply InstallOp | ✅ gid2 正常服务，DeleteShard 异步重试 |
+
+**协议选择的核心原则：激活路径不能有外部依赖**。gid2 是迁移受益者，它激活必须自给自足。
+
+**迁移窗口的 service gap**：
+```
+t0: gid1 FreezeOp apply → Frozen,拒 Get/Put
+================= gap 开始 =================
+t0 → t1: client Get/Put 到 gid1 → ErrWrongGroup
+         client Get/Put 到 gid2 → ErrWrongGroup (Absent 状态)
+         client 刷 cfg 也救不了(还是 cfg2,路由到 gid2 仍 Absent)
+         client 在 sleep+retry 循环里等
+t1: gid2 InstallOp apply → Normal,开始服务
+================= gap 结束 =================
+t1 之后: client 重试命中 gid2 → 成功
+t2: controller → gid1 DeleteShard (best-effort,不影响 t1 后的服务)
+```
+
+**liveness 靠 gid2 最终 Install 成功打破**，不依赖 gid1。gap 典型几百 ms（一次 RPC 往返 + Raft 提交），测试 `checkShutdownSharding`（test.go:190）期望 `ndone < n` 验证 shard 真的不可用。
+
+**核心不变式**: Frozen 和 Gone 在功能上行为一致 — 都返回 `ErrWrongGroup`。区别只在内部：`Frozen` 数据还在（打包给 FreezeShardReply 用），`Gone` 数据已删。对外可见的只有"服务"vs"不服务"两态。`DoGet`/`DoPut` 里判断 shardState 只要非 `Normal` 就一律 `ErrWrongGroup`，不用分 Frozen/Gone。
+
+---
+
+### BUG-L5-006 · Frozen 必须拒绝 Get：线性一致的可见性边界问题　`【概念】`
+
+**文件**: `src/shardkv1/shardgrp/server.go` — `DoGet`
+
+**常见误区**：Frozen 期间数据还在 gid1 上，且 t0→t1 窗口里 S 上零写入（gid1 frozen 拒写、gid2 Absent 拒写），那 Frozen 时允许 Get 继续返回数据应该是安全的吧？
+
+**错误论证链（曾经绕进去的版本）**：
+1. ❌ " gid1 frozen 后数据会被并发写" — **错**，t0→t1 窗口里 gid1 拒写、gid2 还没 Install 也拒写，S 上完全静止
+2. ❌ "因为数据会变，所以 frozen 读会读到过时数据" — **前提错了**
+3. ✅ **真正的理由**：t1 之后 gid2 激活开始服务，此后可能发生新写。如果 gid1 frozen 时允许读，client 不会收到 `ErrWrongGroup` → 不会刷 cfg → 不会路由到 gid2 → 会一直读到 gid1 的 t0 快照。t1 之后这些读违反 real-time order（t2 的 Put 完成后，任何 t2 之后的 Get 必须读到新值）。
+
+**线性一致破坏时序**：
+```
+t0: gid1 freeze → frozen, 仍提供 Get (假设的错误设计)
+t1: gid2 Install 完成, 开始服务
+t2: client B Put("x", v1) → gid2 → 成功
+t3: client A (cfg1 缓存未刷新) Get("x") → gid1 → 拿到 v0 (旧快照)
+    ↑
+    t2 < t3, B 的 Put 在前, A 的 Get 在后
+    线性一致要求 A 读到 v1，但 A 读到 v0 → ❌
+```
+
+**核心不是数据竞争，是"可见性边界"**：Frozen 之后，gid1 必须停止数据可见性，强制 client 转移到 gid2，才能保证 client 后续读到的是 gid2 的最新数据。只要 frozen 拒绝读 → client 收到 `ErrWrongGroup` → 刷 cfg → 路由到 gid2 → 读到最新。
+
+**与 Get 走不走 Raft 无关**：即使实现了快速读（ReadIndex / Lease / No-op），在 Frozen 态也必须拒绝。快速读只在 Normal 态有用（省 Raft 日志提交开销）。
+
+**核心不变式**: `shardState[S] != Normal` 时 `DoGet`/`DoPut` 一律返回 `ErrWrongGroup`。Frozen 数据保留纯粹是为了等 FreezeShard RPC 时打包，不是为了读。对外可见性在 freeze 那一刻已经完全切断。
+
+---
+
+### BUG-L5-007 · 快速读与分片迁移不兼容的深层原因　`【概念】`
+
+**常见疑问**：如果实现了快速读（ReadIndex / Lease / No-op+本地读），frozen 上读是不是天然安全？
+
+**结论**：No-op 快速读在分片迁移场景下会挂 — 除非把 shardState 当作读屏障 + 迁移协议做得非常精密（双 read 路径 + 配置原子切换）。2026 版用"Get 也走 Raft + Frozen 时一律 ErrWrongGroup"绕开这个难题。
+
+**No-op 方案的根本弱点**：leader 上任时插一条 no-op op 进 log，确保 commitIndex ≥ 这个 no-op 的 index。之后的"本地读"不进 log，直接读状态机。**但 no-op 本质上是把"当前状态机的快照版本"钉死在 no-op 提交那一刻**。
+
+**在分片迁移下暴露的问题**：
+```
+gid2 上任时 (假设 cfg2 已经发布但 gid2 还没 Install S)
+    client A (cfg2) Get("x") 路由到 gid2
+    gid2 leader 走快速读：我是 leader, 状态机里查 x
+      ① shardState[S] = Absent → 该返回什么?
+         - 返回 ErrNoKey: 错! x 在 gid1 那边还有值,不是真的不存在
+         - 返回 ErrWrongGroup: client 死循环(直到 Install op apply)
+         - 返回旧数据: 状态机里根本没有 x,没东西可返回
+```
+
+**解法（如果一定要支持快速读）**：状态机里必须有 shardState 标记作为"读屏障"。`Absent`/`Waiting` 状态返回 `ErrWrongGroup`，只有 `Normal` 才允许快速读。但这又退回"client 死循环等迁移完成"，快速读**没有收益** — client 卡住的根本原因不是日志提交开销，是状态机里没有数据。
+
+**工业级方案**：DynamoDB/Spanner/CockroachDB 用"双 read 路径 + 配置原子切换" — gid1 frozen 仍可读返回 freeze 时刻快照，gid2 Install 完成后开始服务。但要求**配置切换是"原子可见"的**：client 要么看到 cfg1 要么看到 cfg2，不能一会 cfg1 一会 cfg2。kvsrv 单机 CAS 满足这个，但 client 缓存 cfg 后**已经路由的 RPC 在途中怎么办**？这需要 "configuration change as consensus"（详见 Spanner/FaRM 论文），不是简单"加个状态"能解决的。
+
+**2026 版选择**：不用快速读，用 ErrWrongGroup 收敛。Get 也走 `rsm.Submit`，迁移窗口期间任何 group 都不服务这个 shard。代价是 migration window 期间 shard 不可用，liveness 靠"迁移最终完成" + 测试给的超时足够长保证。
+
+**核心原则**: 快速读只确认 leader 身份，不确认"读的数据仍是当前权威"。迁移期间数据可能已在新 owner 那边被写，old owner 的快速读会返回过时数据，破坏线性一致。2026 版用"避免快速读"换"正确性可证"，牺牲一点性能换工程简单度。
+
+---
+
+### BUG-L5-008 · shardgrp clerk 无限重试 → 组离开后 shardkv clerk 永不刷新配置　`【正确性】`
+
+**文件**: `src/shardkv1/shardgrp/client.go` — `Get` / `Put`
+
+**问题**：`TestJoinLeaveBasic5A` 在 `leave(Gid1)` + `Shutdown(Gid1)` 之后，`CheckGet` 永久卡死（goroutine 栈停在 `shardgrp/client.go` 的重试循环 → `shardkv/client.go:79`）。leave 的迁移其实已经完成、cfg 已更新为新配置，但客户端读不到数据。
+
+**根因（两层 clerk 的失配）**：
+- shardkv clerk 只在收到 **`ErrWrongGroup`** 时才刷新配置、重新路由。
+- 但一个**已离开并下线**的组，shardgrp clerk 收到的是**网络失败（`ok==false`）**，不是 `ErrWrongGroup`。
+- 旧代码里 shardgrp clerk 对网络失败/`ErrWrongLeader` **无限 `for {}` 重试**，永不返回 → shardkv clerk 永远等不到返回值 → 没机会刷新到新配置 → 一直把 key 路由到那个下线的旧组。
+
+**错误代码**：
+```go
+func (ck *Clerk) Get(key string) (...) {
+    for {                                   // ← 无限重试，组下线时永不返回
+        ok := ck.Call(ck.servers[ck.leader], "KVServer.Get", &args, &reply)
+        if ok && reply.Err != rpc.ErrWrongLeader { return ... }
+        ck.leader = (ck.leader + 1) % len(ck.servers)
+        time.Sleep(100 * time.Millisecond)
+    }
+}
+```
+
+**正确做法**：给 shardgrp clerk 的重试加**轮数上限**，超过就返回 `ErrWrongGroup`，把控制权交还上层让它重读配置：
+```go
+const maxRetries = 30
+func (ck *Clerk) Get(key string) (...) {
+    for tries := 0; tries < maxRetries; tries++ {
+        ok := ck.Call(...)
+        if ok && reply.Err != rpc.ErrWrongLeader { return ... }
+        ck.leader = (ck.leader + 1) % len(ck.servers)
+        time.Sleep(100 * time.Millisecond)
+    }
+    return "", 0, rpc.ErrWrongGroup   // 多轮联系不上 → 让 shardkv clerk 刷新配置重路由
+}
+```
+shardkv clerk 收到 `ErrWrongGroup` 后 `cfg=nil` 重新 `Query()` → 读到新配置 → 路由到新 owner。只有第一个误路由的 key 付一次超时代价，刷新后 cfg 缓存为新配置，其余 key 直接命中。
+
+**核心不变式**: 「整组下线/离开」和「分片不归本组」对客户端是**同一类需要重读配置的事件**，但底层信号不同（网络失败 vs `ErrWrongGroup`）。clerk 必须把「持续联系不上」也归一为「该刷新配置」，不能无限重试一个可能已经不存在的组——否则上层永远拿不到刷新配置的机会。
+
+---
