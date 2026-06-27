@@ -318,11 +318,16 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 			kv.shardState[s] = Ready
 		}
 	}
-	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
-
+	// 必须先从快照恢复应用层状态，再启动 raft / apply 协程。
+	// MakeRSM 内部会 go readApplyCh()，raft 重启后 appliedIndex=snapshotIndex，
+	// 只通过 applyCh 投递 snapshotIndex+1.. 的已提交日志（不会重发快照）。
+	// 若 Restore 晚于 apply 协程，这些日志会落在空/默认状态上：Put 因 shard 仍是
+	// NotOwned 被当作 ErrWrongGroup 丢弃，随后 Restore 又把 shard 置回 Ready，
+	// 于是该键永远缺失 → 客户端 Get 误报 ErrNoKey（且 Restore 与 DoOp 并发读写 kvMap 是 data race）。
 	if persister.SnapshotSize() > 0 {
 		kv.Restore(persister.ReadSnapshot())
 	}
+	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 
 	return []any{kv, kv.rsm.Raft()}
 }

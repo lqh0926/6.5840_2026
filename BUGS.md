@@ -962,3 +962,76 @@ shardkv clerk 收到 `ErrWrongGroup` 后 `cfg=nil` 重新 `Query()` → 读到�
 **核心不变式**: 「整组下线/离开」和「分片不归本组」对客户端是**同一类需要重读配置的事件**，但底层信号不同（网络失败 vs `ErrWrongGroup`）。clerk 必须把「持续联系不上」也归一为「该刷新配置」，不能无限重试一个可能已经不存在的组——否则上层永远拿不到刷新配置的机会。
 
 ---
+
+### BUG-L5-009 · 重启时 Restore 晚于 apply 协程启动，已提交日志落在空状态上被丢弃 → 误报 ErrNoKey　`【High】` `【经典错误】`
+
+**文件**: `src/shardkv1/shardgrp/server.go` — `StartServerShardGrp`
+
+**现象**：分区/重启相关的 5C 测试（`TestPartitionRecovery*5C` 等）**间歇性**失败，客户端对一个明明 Put 过的 key `Get` 误报 `ErrNoKey`；该组该分片是 `Ready`，但 kvMap 里就是缺这个键。可靠网络/无重启的 5A 用例从不复现。
+
+**错误代码**：
+```go
+kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)  // 内部已 go readApplyCh()
+
+if persister.SnapshotSize() > 0 {
+    kv.Restore(persister.ReadSnapshot())   // ❌ 在 apply 协程启动之后才恢复
+}
+```
+
+**根因**：raft 重启后 `appliedIndex = commitIndex = snapshotIndex`，**不会**用 applyCh 重发快照，而是约定**服务层自己**从快照恢复，raft 只通过 applyCh 投递 `snapshotIndex+1..` 的已提交日志增量。而 `MakeRSM` 内部 `go readApplyCh()` **立刻**启动了 apply 协程。若 leader 较积极地推进 commit，apply 协程会在 `kv.Restore()` 之前就把已提交日志喂给 `DoOp`，而此时 `kvMap` 是空的、`shardState` 是默认值（非 Gid1 全 `NotOwned`）：
+
+1. 日志里的 `Put(k2∈s)` 先被 `DoPut` 处理 → 此刻 `shardState[s]==NotOwned` → 直接 `ErrWrongGroup`，**不写 kvMap**，这条已提交的 Put 被丢弃；
+2. 紧接着 `kv.Restore(快照)` 把 `shardState[s]` 恢复成 `Ready`、`kvMap` 恢复成快照内容（**没有 k2**）；
+3. raft 的 `appliedIndex` 已越过这条日志，不会再投递一次；
+4. 客户端 `Get(k2)` → `shardState[s]==Ready` → 查 kvMap 缺失 → **误报 ErrNoKey**。
+
+（Install 类日志若先于 Restore 被应用，会被快照覆盖丢数据或把分片卡在 `NotOwned`，同源问题。此外 `Restore` 与 `DoOp` 并发读写 `kvMap` 本身也是 data race。）
+
+之所以是「间歇」：`StartServers` 后 follower 要先重新入群、收到 AppendEntries 推进 commit 才会触发 apply，通常 `Restore`（µs 级）抢先赢了；但不保证，调度/负载一变就翻车。
+
+**正确做法**：把 Restore 提到 `MakeRSM` **之前**，保证 apply 协程拿到的永远是已恢复好的状态，日志增量叠加在快照之上：
+```go
+if persister.SnapshotSize() > 0 {
+    kv.Restore(persister.ReadSnapshot())   // ✅ 先恢复
+}
+kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)  // 再启动 raft / apply
+```
+
+**核心不变式**: 服务层从快照恢复状态，必须在 RSM 的 apply 循环处理**任何** `snapshotIndex+1` 之后的日志**之前**完成——否则那些已提交日志会落在空/默认状态上被错误处理并永久丢失。「先 Restore 再 MakeRSM」是与 raft「appliedIndex 从 snapshotIndex 起、只投递增量」语义对齐的唯一安全顺序。
+
+---
+
+### BUG-L5-010 · `next` 的 CAS 在非 OK 时要「重读 next 确认归属」——并发同 num 不同配置下会误报 ErrNoKey　`【High】`
+
+**文件**: `src/shardkv1/shardctrler/shardctrler.go` — `ChangeConfigTo`
+
+`ChangeConfigTo` 第一步 `Put("next", new, Num-1)` 是 CAS 发布迁移意图。kvsrv clerk 在重发撞 `ErrVersion` 时会返回 `ErrMaybe`（写其实已成功、回复丢了）。两种极端处理都错：
+- 一律 `err != OK { return }`：不可靠网络下把「自己已写成功的那轮」也放弃 → join/leave 不生效（`TestOneConcurrentClerkUnreliable5A` 报 `leaveGroups failed`、`TestJoinLeave5B` 失败）。
+- 一律「ErrMaybe 就继续」：并发下多个 controller 对**同一 num 提议不同配置**时（`concurCtrler` 每个 worker join 不同 ngid），输家拿到 ErrMaybe 也继续，去迁移自己那份**没人认的配置** → 与真正赢家配置冲突 → 数据错乱、`Get` 误报 **ErrNoKey**（`TestAcquireLockConcurrentUnreliable5C` 实测 ~1/3 复现）。
+
+**正解**：非 OK 时**重读 `next`**，只有它确实等于自己的配置才继续，否则放弃：
+```go
+if err := sck.IKVClerk.Put("next", new.String(), rpc.Tversion(new.Num-1)); err != rpc.OK {
+    if got, _ := sck.readCfg("next"); got == nil || got.String() != new.String() {
+        return // 没抢到 next（别的配置占了这一轮 / 我没写成功）→ 放弃
+    }
+    // next 确实是 new：我的写已生效（ErrMaybe 实为成功）→ 继续
+}
+```
+
+**核心不变式**: `ErrMaybe` 是「可能已生效」的暧昧态——既不能当确定失败回退、也不能当确定成功盲目前进，要靠**重读权威状态**（这里是 `next`）定夺归属。
+
+---
+
+## 踩坑 / 决策记录（非最终代码，避免再走弯路）
+
+### NOTE-L5-A · lease / 迁移加重试上限 / clerk 缓存 都试过、都回退了
+
+调 `TestPartitionRecovery*5C` 在 `-race` 下偶发 DATA RACE 时绕了很大弯，结论先记下：
+
+- **不要给迁移三方法加 `maxRetries` 上限 + 让 migrate 中止**：曾以为 concurCtrler 会卡死在「已 leave 下线的组」上，其实那次「死锁」是**同时跑 5 个 `-race` 进程压垮 CPU** 的假象，单进程无界 `for{}` 本就能过。加上限后不可靠网络的合法 join/leave 被误杀。
+- **不要加 lease/epoch 让老控制器「被取代后退出」**：ShardCtrler 是**库**，生命周期归调用者；库不该自决谁失败。lease 只把 partition race 从 ~40% 降到 ~25%，没真解决，反而违背库语义。
+- **DATA RACE 的真凶在 tester 框架内部、无锁**：`group.go` 的 `sg.srvs[]`(StartServer vs disconnect)、`sockrpc/rpcsrv.go` 的 `rpcs.l`(listen vs Close)。触发方是 `partitionCtrler` 后台 goroutine 的 join/leave churn 撞测试结尾 `Cleanup`。**严重度只随配置变更速度变**。
+- **timing 是三方耦合**：5B 的 2s 死线要迁移**快**(caching / sleep 20~50ms)；partition cleanup race 要 churn **慢**；unreliable 的 raft 重启重连要 RPC 负载**低**。20/50ms 或 caching 会触发 cleanup race 或 unreliable 选举风暴(term→1000+，根因是 server 重启后 daemon socket 重连 + 丢包，纯框架/时序)。
+
+**最终选择**：迁移退避保持 **100ms**（HEAD 的负载水平，partition/unreliable/concurrent 都稳），接受 `TestJoinLeave5B` 那条 2s 死线偶发 flaky（对任何实现都紧，属这类测试固有抖动）。只保留两个真正的正确性修复：[[BUG-L5-009]] 的 Restore 顺序、本条 BUG-L5-010 的 ErrMaybe 重读。实测 `make RUN='-run 5' shardkv` 一轮 23/23 全过。

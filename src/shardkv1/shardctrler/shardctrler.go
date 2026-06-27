@@ -19,7 +19,6 @@ type ShardCtrler struct {
 	kvtest.IKVClerk
 
 	killed int32 // 由 Kill() 设置
-	// 你的数据写在这里。
 }
 
 // 创建一个 ShardCtrler，将其状态存储在 kvsrv 中。
@@ -27,7 +26,6 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 	sck := &ShardCtrler{clnt: clnt}
 	srv := tester.ServerName(tester.GRP0, 0)
 	sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)
-	// 你的代码写在这里。
 	return sck
 }
 
@@ -45,7 +43,7 @@ func (sck *ShardCtrler) InitController() {
 	// migrate 幂等，已完成的分片会被 shardgrp 按 Num no-op，所以重跑安全。
 	if next.Num > cur.Num {
 		sck.migrate(cur, next)
-		sck.IKVClerk.Put("cfg", next.String(), rpc.Tversion(next.Num-1))
+		_ = sck.IKVClerk.Put("cfg", next.String(), rpc.Tversion(next.Num-1))
 	}
 }
 
@@ -70,17 +68,26 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	if new.Num <= cur.Num {
 		return // 旧的或重复的配置，忽略
 	}
-	// ① 发布意图：CAS 写 next。version=Num-1 与 Num 恒等，
-	//    同一 Num 只有一个 controller 写成功（Part A 无并发，必成功）。
-	//    崩溃后新 controller 靠这条 next 在 InitController 里发现并前滚。
-	sck.IKVClerk.Put("next", new.String(), rpc.Tversion(new.Num-1))
+	// ① 发布意图：CAS 写 next（version=Num-1 与 Num 恒等）。
+	//    并发下多个 controller 可能对同一 num 提议**不同**的配置，必须保证只有一个能往下走。
+	//    - OK：我写成功，next 就是我的配置 → 继续。
+	//    - 非 OK（ErrVersion / ErrMaybe）：不能凭返回码决定。ErrMaybe 下我的写可能已生效，
+	//      但也可能是别人的配置先占了 next。所以**重读 next**：只有它确实等于我的配置才继续，
+	//      否则说明被别的配置抢占（或我没写成功）→ 放弃。绝不能在没抢到 next 时去迁移自己的配置，
+	//      那会与真正的赢家配置冲突、造成数据错乱（ErrNoKey）。
+	if err := sck.IKVClerk.Put("next", new.String(), rpc.Tversion(new.Num-1)); err != rpc.OK {
+		if got, _ := sck.readCfg("next"); got == nil || got.String() != new.String() {
+			return
+		}
+	}
 
 	// ② 迁移：把 cur 搬到 new。
 	sck.migrate(cur, new)
 
 	// ③ 发布 current：迁移全部完成后才更新 cfg，
 	//    使 Query 读到的配置始终反映「已完成」的迁移（崩溃时退回旧配置不丢数据）。
-	sck.IKVClerk.Put("cfg", new.String(), rpc.Tversion(new.Num-1))
+	//    若此步 CAS 失败（被其它 controller 抢先发布），迁移幂等，直接返回即可。
+	_ = sck.IKVClerk.Put("cfg", new.String(), rpc.Tversion(new.Num-1))
 }
 
 // migrate 把配置从 cur 推进到 new：对每个换了归属的分片，
