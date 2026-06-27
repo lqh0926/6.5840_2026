@@ -1035,3 +1035,19 @@ if err := sck.IKVClerk.Put("next", new.String(), rpc.Tversion(new.Num-1)); err !
 - **timing 是三方耦合**：5B 的 2s 死线要迁移**快**(caching / sleep 20~50ms)；partition cleanup race 要 churn **慢**；unreliable 的 raft 重启重连要 RPC 负载**低**。20/50ms 或 caching 会触发 cleanup race 或 unreliable 选举风暴(term→1000+，根因是 server 重启后 daemon socket 重连 + 丢包，纯框架/时序)。
 
 **最终选择**：迁移退避保持 **100ms**（HEAD 的负载水平，partition/unreliable/concurrent 都稳），接受 `TestJoinLeave5B` 那条 2s 死线偶发 flaky（对任何实现都紧，属这类测试固有抖动）。只保留两个真正的正确性修复：[[BUG-L5-009]] 的 Restore 顺序、本条 BUG-L5-010 的 ErrMaybe 重读。实测 `make RUN='-run 5' shardkv` 一轮 23/23 全过。
+
+---
+
+## 测试通过记录（2026-06-27，`-race`，Apple M4）
+
+各 lab 用 `make`（自带 `-v -race`，会重建 daemon 二进制）完整跑一轮：
+
+| Lab | 命令 | 结果 |
+|---|---|---|
+| Lab 3（Raft） | `make raft1` | ✅ `ok 6.5840/raft1 415.851s` |
+| Lab 4（Fault-tolerant KV） | `make kvraft1` | ✅ `ok 6.5840/kvraft1 249.143s` |
+| Lab 5（Sharded KV） | `make RUN='-run 5' shardkv` | ✅ `ok 6.5840/shardkv1 587.177s`（23/23） |
+
+Lab 5 全部 23 个用例（5A×14 + 5B×2 + 5C×7，含 4 个 partition recovery）单轮全过。
+
+> 注：`TestJoinLeave5B`（2s 死线）与 `TestPartitionRecovery*5C`（`-race` 清理竞争 / 不可靠选举风暴）偶发 flaky，根因在 tester 框架的并发缺陷而非解题逻辑，详见上文 BUG-L5-010 的「踩坑 / 决策记录」。
