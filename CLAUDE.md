@@ -73,9 +73,8 @@ go run mrworker.go wc.so &            # start workers (one per invocation)
 
 ## Git Configuration
 
-- **Push remote**: Use `mygithub` (GitHub) instead of `origin` (MIT CSAIL requires auth)
-  - Remote URL: `https://github.com/lqh0926/6.5840_2026.git`
-  - Push command: `git push mygithub master`
+- **Push remote**: `origin` → `https://github.com/lqh0926/6.5840_2026.git`
+  - Push command: `git push origin master`
 
 ## Bug Log
 
