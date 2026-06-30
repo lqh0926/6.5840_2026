@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"6.5840/labgob"
-	"6.5840/labrpc"
+	"6.5840/persist"
 	"6.5840/raftapi"
-	tester "6.5840/tester1"
+	"6.5840/transport"
 )
 
 const (
@@ -26,7 +26,7 @@ type LogEntry struct {
 
 type AppendEntries struct {
 	Term          int
-	LeaderId      int
+	LeaderId      transport.NodeID
 	PrevLogIndex  int
 	PrevLogTerm   int
 	Entries       []LogEntry
@@ -44,18 +44,18 @@ type AppendEntriesReply struct {
 
 type Raft struct {
 	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd
-	persister *tester.Persister
-	me        int
+	peers     []transport.ClientEnd
+	persister persist.Persister
+	me        transport.NodeID
 
 	// Persistent state
 	term    int
-	voteFor int
+	voteFor transport.NodeID
 	logs    []LogEntry // logs[0] is sentinel; absolute index i → logs[i - snapshotIndex]
 
 	// Volatile state
 	customerId   int
-	leaderId     int
+	leaderId     transport.NodeID
 	voteCount    int
 	commitIndex  int
 	appliedIndex int
@@ -65,8 +65,12 @@ type Raft struct {
 	snapshot      []byte
 
 	// Per-peer replication state (only meaningful when leader)
-	matchIndex []int // matchIndex[i]: highest log index confirmed replicated on peer i (only increases)
-	nextIndex  []int // nextIndex[i]:  next log index to send to peer i (can decrease on failure)
+	matchIndex map[transport.NodeID]int // highest log index confirmed replicated on peer (only increases)
+	nextIndex  map[transport.NodeID]int // next log index to send to peer (can decrease on failure)
+
+	// Peer identity mapping
+	nodeIDs   []transport.NodeID       // 全部节点 NodeID 的有序列表（与 peers 切片平行）
+	nodeIndex map[transport.NodeID]int // 反向索引：NodeID → peers 切片下标
 
 	resetCh    chan struct{}
 	newEntryCh chan struct{} // signal from Start() to heartbeat goroutine: replicate immediately
@@ -111,7 +115,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var term int
 	var logs []LogEntry
-	var voteFor int
+	var voteFor transport.NodeID
 	var snapshotIndex int
 	if d.Decode(&term) != nil || d.Decode(&logs) != nil ||
 		d.Decode(&voteFor) != nil || d.Decode(&snapshotIndex) != nil {
@@ -154,7 +158,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 type RequestVoteArgs struct {
 	Term         int
-	CandidateId  int
+	CandidateId  transport.NodeID
 	LastLogIndex int
 	LastLogTerm  int
 }
@@ -169,8 +173,8 @@ type RequestVoteReply struct {
 func (rf *Raft) stepDown(newTerm int) {
 	rf.term = newTerm
 	rf.customerId = Follower
-	rf.leaderId = -1
-	rf.voteFor = -1
+	rf.leaderId = ""
+	rf.voteFor = ""
 	rf.voteCount = 0
 	rf.persist()
 }
@@ -195,7 +199,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	logOk := args.LastLogTerm > lastTerm ||
 		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIdx)
 
-	if (rf.voteFor == -1 || rf.voteFor == args.CandidateId) && logOk {
+	if (rf.voteFor == "" || rf.voteFor == args.CandidateId) && logOk {
 		rf.voteFor = args.CandidateId
 		rf.persist()
 		select {
@@ -317,8 +321,8 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntries, reply *AppendEntriesRe
 
 // --- RPC senders ---
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntries, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntriesHandler", args, reply)
+func (rf *Raft) sendAppendEntries(server transport.NodeID, args *AppendEntries, reply *AppendEntriesReply) bool {
+	ok := rf.peers[rf.nodeIndex[server]].Call("Raft.AppendEntriesHandler", args, reply)
 	if !ok {
 		return ok
 	}
@@ -353,12 +357,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntries, reply *Append
 				continue
 			}
 			cnt := 1
-			for i := range rf.peers {
-				if i != rf.me && rf.matchIndex[i] >= N {
+			for _, id := range rf.nodeIDs {
+				if id != rf.me && rf.matchIndex[id] >= N {
 					cnt++
 				}
 			}
-			if cnt > len(rf.peers)/2 {
+			if cnt > len(rf.nodeIDs)/2 {
 				rf.commitIndex = N
 			}
 		}
@@ -380,8 +384,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntries, reply *Append
 	return ok
 }
 
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+func (rf *Raft) sendRequestVote(server transport.NodeID, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[rf.nodeIndex[server]].Call("Raft.RequestVote", args, reply)
 	if !ok {
 		return ok
 	}
@@ -396,13 +400,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		return ok
 	}
 	rf.voteCount++
-	if rf.voteCount > len(rf.peers)/2 {
+	if rf.voteCount > len(rf.nodeIDs)/2 {
 		rf.customerId = Leader
 		rf.leaderId = rf.me
 		lastIdx := rf.lastLogIndex()
-		for i := range rf.peers {
-			rf.matchIndex[i] = 0
-			rf.nextIndex[i] = lastIdx + 1
+		for _, id := range rf.nodeIDs {
+			rf.matchIndex[id] = 0
+			rf.nextIndex[id] = lastIdx + 1
 		}
 	}
 	return ok
@@ -453,11 +457,11 @@ func (rf *Raft) startElection() {
 	term := rf.term
 	rf.mu.Unlock()
 
-	for i := range rf.peers {
-		if i == rf.me {
+	for _, id := range rf.nodeIDs {
+		if id == rf.me {
 			continue
 		}
-		go func(server int) {
+		go func(server transport.NodeID) {
 			args := &RequestVoteArgs{
 				Term:         term,
 				CandidateId:  rf.me,
@@ -465,7 +469,7 @@ func (rf *Raft) startElection() {
 				LastLogTerm:  lastTerm,
 			}
 			rf.sendRequestVote(server, args, &RequestVoteReply{})
-		}(i)
+		}(id)
 	}
 }
 
@@ -475,17 +479,16 @@ func (rf *Raft) startHeartbeat() {
 		if rf.customerId == Leader {
 			term := rf.term
 			me := rf.me
-			for i := range rf.peers {
-				if i == rf.me {
+			for _, id := range rf.nodeIDs {
+				if id == rf.me {
 					continue
 				}
-				prevLogIndex := rf.nextIndex[i] - 1
+				prevLogIndex := rf.nextIndex[id] - 1
 				if prevLogIndex > rf.lastLogIndex() {
 					prevLogIndex = rf.lastLogIndex()
 				}
 				var prevLogTerm int
 				var snapshot []byte
-				// TODO(3D): if prevLogIndex < rf.snapshotIndex, send InstallSnapshot instead.
 				if prevLogIndex < rf.snapshotIndex {
 					prevLogIndex = 0
 					snapshot = rf.snapshot
@@ -500,7 +503,7 @@ func (rf *Raft) startHeartbeat() {
 				leaderCommit := rf.commitIndex
 				snapshotIndex := rf.snapshotIndex
 				snapshotTerm := rf.logs[0].Term
-				go func(server int) {
+				go func(server transport.NodeID) {
 					rf.sendAppendEntries(server, &AppendEntries{
 						Term:          term,
 						LeaderId:      me,
@@ -512,7 +515,7 @@ func (rf *Raft) startHeartbeat() {
 						SnapshotIndex: snapshotIndex,
 						SnapshotTerm:  snapshotTerm,
 					}, &AppendEntriesReply{})
-				}(i)
+				}(id)
 			}
 		}
 		rf.mu.Unlock()
@@ -585,8 +588,17 @@ func (rf *Raft) sendApplyMsg() {
 
 // --- Make ---
 
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+func Make(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID,
+	persister persist.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+	matchIndex := make(map[transport.NodeID]int, len(peers))
+	nextIndex := make(map[transport.NodeID]int, len(peers))
+	nodeIndex := make(map[transport.NodeID]int, len(peers))
+	for i, id := range nodeIDs {
+		nodeIndex[id] = i
+		matchIndex[id] = 0
+		nextIndex[id] = 0
+	}
+
 	rf := &Raft{
 		peers:      peers,
 		persister:  persister,
@@ -594,11 +606,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		term:       0,
 		customerId: Follower,
 		logs:       []LogEntry{{Term: 0}},
-		leaderId:   -1,
-		voteFor:    -1,
+		leaderId:   "",
+		voteFor:    "",
 		applyCh:    applyCh,
-		matchIndex: make([]int, len(peers)),
-		nextIndex:  make([]int, len(peers)),
+		matchIndex: matchIndex,
+		nextIndex:  nextIndex,
+		nodeIDs:    nodeIDs,
+		nodeIndex:  nodeIndex,
 	}
 
 	rf.readPersist(persister.ReadRaftState())
@@ -625,7 +639,7 @@ func (rf *Raft) logStatus() {
 	for {
 		time.Sleep(2000 * time.Millisecond)
 		rf.mu.Lock()
-		log.Printf("[Raft %d] role=%s term=%d logLen=%d snapIdx=%d commit=%d applied=%d leader=%d",
+		log.Printf("[Raft %s] role=%s term=%d logLen=%d snapIdx=%d commit=%d applied=%d leader=%s",
 			rf.me, roleNames[rf.customerId], rf.term, len(rf.logs),
 			rf.snapshotIndex, rf.commitIndex, rf.appliedIndex, rf.leaderId)
 		rf.mu.Unlock()

@@ -8,6 +8,7 @@ import (
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
+	"6.5840/persist"
 	"6.5840/raftapi"
 	"6.5840/tester1"
 
@@ -29,7 +30,7 @@ type rfsrv struct {
 	ts          Itester
 	me          int
 	lastApplied int
-	persister   *tester.Persister
+	persister   persist.Persister
 
 	mu   sync.Mutex
 	raft raftapi.Raft
@@ -46,7 +47,7 @@ func NewRfsrv(tc *tester.TesterClnt, ends []*labrpc.ClientEnd, grp tester.Tgid, 
 // Each Raft server uses a raft library to Start a command and read
 // committed commands from the library's apply channel.  The server
 // can be run in two configurations: without and without snapshots.
-func newRfsrv(ts Itester, ends []*labrpc.ClientEnd, grp tester.Tgid, srv int, persister *tester.Persister, snapshot bool) *rfsrv {
+func newRfsrv(ts Itester, ends []*labrpc.ClientEnd, grp tester.Tgid, srv int, persister persist.Persister, snapshot bool) *rfsrv {
 
 	// grab a copy of the initial snapshot, to avoid
 	// a possible race with raft.Make() and the
@@ -61,7 +62,7 @@ func newRfsrv(ts Itester, ends []*labrpc.ClientEnd, grp tester.Tgid, srv int, pe
 	}
 	applyCh := make(chan raftapi.ApplyMsg)
 	if !tester.UseRaftStateMachine {
-		s.raft = Make(ends, srv, persister, applyCh)
+		s.raft = MakeFromLabrpc(ends, srv, persister, applyCh)
 	}
 	if snapshot {
 		if sn != nil && len(sn) > 0 {

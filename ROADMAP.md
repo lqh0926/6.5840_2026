@@ -22,8 +22,8 @@
 - [ ] 🟣 把**传输**抽到接口背后（labrpc 成为接口的一个实现）
 - [ ] 🟣 把**持久化**抽到接口背后（内存 Persister 成为一个实现）
 - [ ] 🟣 把**节点寻址**抽象：下标 `int` → 稳定 `NodeID` + 地址映射
-- [ ] 🟢 让代码能编成真 binary（`main` 包 + flag/配置加载 + 启动引导）
-- [ ] 🟢 埋最基础的结构化日志（zap / slog）
+
+> ~~真 binary / 结构化日志~~ 移至 Phase 1：labrpc 是进程内模拟网络，binary 必须有跨进程真传输（gRPC）才有意义，二者一起落地。
 
 ---
 
@@ -33,10 +33,15 @@
 > 验收：labrpc 测试 + gRPC loopback 测试都绿。
 
 - [ ] 🟢 定义 `.proto`：Raft（RequestVote / AppendEntries / InstallSnapshot）+ KV（Get/Put/Append）
-- [ ] 🟢 gRPC transport 实现传输接口
+- [ ] 🟢 gRPC transport 实现传输接口（泛型 `Call` 在适配器内按 method 名 dispatch）
 - [ ] 🟢 序列化 gob → protobuf（顺带拿到 schema 演进能力）
+- [ ] 🟢 **真 binary**（从 Phase 0 移入）：`cmd/raftkvd` main 包 + flag/env 配置（`--node-id/--listen/--peers/--data-dir`）+ 启动引导，起 gRPC server 挂 Raft handler + KV service
+- [ ] 🟢 埋最基础的结构化日志（slog 优先，标准库零依赖）
 - [ ] 🟣 编写 fault interceptor（可编程注入 drop/delay/error）
 - [ ] ~~快照分块流式传输~~ **砍**：边际价值低，普通 InstallSnapshot 够用
+
+> **binary 不暴露 `Raft.Start`**（错的层，绕过去重/重定向/状态机）。Phase 1 后对外即有 gRPC KV API（Get/Put/Append）；
+> 验端到端用 `grpcurl` 或薄 `cmd/raftkvctl`（调 KV 操作，非 Start）。REST（Phase 4）是其上的 HTTP 门面。
 
 ---
 
@@ -104,9 +109,13 @@
 
 | 层 | 机制 | 职责 | 标记 |
 |----|------|------|------|
-| L1 | labrpc（Phase 0 抽象后的一个实现） | 保留**全部** 6.5840 原测试 + `models1/` 线性化检查器，回归网 | 🟢 现成 |
-| L2 | 真 gRPC + fault interceptor | 验证换 gRPC 后不变式不破；搬关键场景（分区/drop/leader crash） | 🟣 自己写 |
+| L1 | labrpc（Phase 0 抽象后的一个实现） | 保留**全部** 6.5840 原测试 + `models1/` 线性化检查器，回归网。**原测试一行不改**（`tester1` 焊死 labrpc，强搬亏） | 🟢 现成 |
+| L2 | 真 gRPC + fault interceptor | 验证换 gRPC 后不变式不破；**只搬 5 个关键场景**（选主/复制/分区恢复/leader crash/响应丢失去重） | 🟣 自己写 |
 | L3/L4 | chaos-mesh 一个故障注入 demo | 真部署下的分区/杀 pod 演示，**别深搞** | ⚪ 懂原理 |
+
+> **L2 不从零重写场景**：场景 = 一串"操作+断言"，与底座无关。抽 `Cluster` 接口（`Leader`/`Disconnect`/`Connect`/`Put`/`Get`），场景写一遍，
+> `labrpcCluster`/`grpcCluster` 各实现一份（`Disconnect` 分别落到 `net.Disconnect` / fault interceptor）。**只对那 5 个场景做，别让全套测试跑这接口**——
+> tester1 焊死 labrpc 参数化亏，且 gRPC 故障注入不如 labrpc 确定，跑全套回归更不稳。全量回归留 L1，L2 只验迁移正确性 + gRPC 独有失败模式。
 
 > **必讲点**：labrpc 的 drop = 调用方明确得到 `false`；真 gRPC 多一种 ——
 > **服务端已处理、响应回程丢失 → 客户端只看到 timeout**。这是 `(clientId, seq)` 去重（exactly-once）的核心场景，

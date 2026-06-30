@@ -7,6 +7,7 @@ import (
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
+	"6.5840/persist"
 	raft "6.5840/raft1"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -59,7 +60,7 @@ type RSM struct {
 //
 // MakeRSM() must return quickly, so it should start goroutines for
 // any long-running work.
-func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
+func MakeRSM(servers []*labrpc.ClientEnd, me int, persister persist.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
 		me:           me,
 		maxraftstate: maxraftstate,
@@ -69,7 +70,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		hashNumMap:   make(map[int]int64),
 	}
 	if !tester.UseRaftStateMachine {
-		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
+		rsm.rf = raft.MakeFromLabrpc(servers, me, persister, rsm.applyCh)
 	}
 	go rsm.readApplyCh()
 	return rsm
