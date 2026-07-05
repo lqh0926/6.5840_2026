@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.5840/labgob"
@@ -76,6 +77,10 @@ type Raft struct {
 	newEntryCh chan struct{} // signal from Start() to heartbeat goroutine: replicate immediately
 	applyCh    chan raftapi.ApplyMsg
 	applyCond  *sync.Cond
+
+	// Shutdown（Kill 用；L1 从不调用，故 done 永不关闭、行为不变）
+	dead int32         // 由 Kill() 置位，killed() 读取
+	done chan struct{} // 由 Kill() 关闭，唤醒 select-based 循环与阻塞的 applyCh 发送
 }
 
 // --- Log index helpers ---
@@ -524,6 +529,9 @@ func (rf *Raft) startHeartbeat() {
 		case <-rf.newEntryCh:
 			timer.Stop()
 		case <-timer.C:
+		case <-rf.done:
+			timer.Stop()
+			return
 		}
 	}
 }
@@ -546,6 +554,9 @@ func (rf *Raft) ticker() {
 				default:
 				}
 			}
+		case <-rf.done:
+			timer.Stop()
+			return
 		}
 	}
 }
@@ -553,8 +564,12 @@ func (rf *Raft) ticker() {
 func (rf *Raft) sendApplyMsg() {
 	for {
 		rf.mu.Lock()
-		for rf.commitIndex == rf.appliedIndex {
+		for rf.commitIndex == rf.appliedIndex && !rf.killed() {
 			rf.applyCond.Wait()
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
 		}
 		startIdx := rf.appliedIndex + 1
 		var snapshot []byte
@@ -568,19 +583,27 @@ func (rf *Raft) sendApplyMsg() {
 		rf.appliedIndex = rf.commitIndex
 		rf.mu.Unlock()
 		if snapshot != nil {
-			rf.applyCh <- raftapi.ApplyMsg{
+			select {
+			case rf.applyCh <- raftapi.ApplyMsg{
 				CommandValid:  false,
 				Snapshot:      snapshot,
 				SnapshotTerm:  snapshotTerm,
 				SnapshotIndex: snapshotIndex,
 				SnapshotValid: true,
+			}:
+			case <-rf.done:
+				return
 			}
 		}
 		for i, entry := range entries {
-			rf.applyCh <- raftapi.ApplyMsg{
+			select {
+			case rf.applyCh <- raftapi.ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: startIdx + i,
+			}:
+			case <-rf.done:
+				return
 			}
 		}
 	}
@@ -620,6 +643,7 @@ func Make(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.
 
 	rf.resetCh = make(chan struct{}, 1)
 	rf.newEntryCh = make(chan struct{}, 1)
+	rf.done = make(chan struct{})
 	rf.applyCond = sync.NewCond(&rf.mu)
 	// After crash-recovery, appliedIndex and commitIndex start at snapshotIndex;
 	// the service layer restores application state from the snapshot directly.
@@ -634,10 +658,32 @@ func Make(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.
 	return rf
 }
 
+// Kill 停止本 Raft 节点的所有后台 goroutine 并使之可被 GC。
+// 幂等（多次调用安全）。用于测试的 crash/重启，以及避免 goroutine 泄漏。
+// Kill 不属于 raftapi.Raft 接口，仅在具体类型 *Raft 上可用。
+func (rf *Raft) Kill() {
+	if !atomic.CompareAndSwapInt32(&rf.dead, 0, 1) {
+		return // 已 Kill
+	}
+	close(rf.done)
+	// 在持锁下 Broadcast，避免与 sendApplyMsg 的「检查条件→Wait」窗口竞争导致漏唤醒。
+	rf.mu.Lock()
+	rf.applyCond.Broadcast()
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) killed() bool {
+	return atomic.LoadInt32(&rf.dead) == 1
+}
+
 func (rf *Raft) logStatus() {
 	roleNames := []string{"Leader", "Follower", "Candidate"}
 	for {
-		time.Sleep(2000 * time.Millisecond)
+		select {
+		case <-rf.done:
+			return
+		case <-time.After(2000 * time.Millisecond):
+		}
 		rf.mu.Lock()
 		log.Printf("[Raft %s] role=%s term=%d logLen=%d snapIdx=%d commit=%d applied=%d leader=%s",
 			rf.me, roleNames[rf.customerId], rf.term, len(rf.logs),

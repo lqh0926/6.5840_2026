@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "6.5840/proto";
+
+// LogEntry represents a single entry in the Raft log.
+message LogEntry {
+  bytes  command = 1; // application-specific command (gob-encoded)
+  int64  term    = 2;
+}
+
+// RequestVote RPC — candidate solicits votes.
+message RequestVoteArgs {
+  int64  term              = 1;
+  string candidate_id      = 2; // transport.NodeID
+  int64  last_log_index    = 3;
+  int64  last_log_term     = 4;
+}
+
+message RequestVoteReply {
+  int64 term         = 1;
+  bool  vote_granted = 2;
+}
+
+// AppendEntries RPC — leader replicates log entries or sends heartbeats.
+message AppendEntriesArgs {
+  int64             term              = 1;
+  string            leader_id         = 2; // transport.NodeID
+  int64             prev_log_index    = 3;
+  int64             prev_log_term     = 4;
+  repeated LogEntry entries           = 5;
+  int64             leader_commit     = 6;
+}
+
+message AppendEntriesReply {
+  int64 term             = 1;
+  bool  success          = 2;
+  int64 last_match_index = 3; // for fast-backtrack
+}
+
+// InstallSnapshot RPC — leader sends a full state snapshot to a lagging follower.
+message InstallSnapshotArgs {
+  int64  term                  = 1;
+  string leader_id             = 2; // transport.NodeID
+  int64  last_included_index   = 3;
+  int64  last_included_term    = 4;
+  bytes  data                  = 5; // raw snapshot bytes
+}
+
+message InstallSnapshotReply {
+  int64 term = 1;
+}
+
+// Raft is the peer-plane gRPC service (node ↔ node).
+service Raft {
+  rpc RequestVote(RequestVoteArgs)       returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesArgs)   returns (AppendEntriesReply);
+  rpc InstallSnapshot(InstallSnapshotArgs) returns (InstallSnapshotReply);
+}

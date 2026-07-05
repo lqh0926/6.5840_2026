@@ -32,12 +32,12 @@
 > 脱离课程框架的硬信号。
 > 验收：labrpc 测试 + gRPC loopback 测试都绿。
 
-- [ ] 🟢 定义 `.proto`：Raft（RequestVote / AppendEntries / InstallSnapshot）+ KV（Get/Put/Append）
-- [ ] 🟢 gRPC transport 实现传输接口（泛型 `Call` 在适配器内按 method 名 dispatch）
-- [ ] 🟢 序列化 gob → protobuf（顺带拿到 schema 演进能力）
-- [ ] 🟢 **真 binary**（从 Phase 0 移入）：`cmd/raftkvd` main 包 + flag/env 配置（`--node-id/--listen/--peers/--data-dir`）+ 启动引导，起 gRPC server 挂 Raft handler + KV service
-- [ ] 🟢 埋最基础的结构化日志（slog 优先，标准库零依赖）
-- [ ] 🟣 编写 fault interceptor（可编程注入 drop/delay/error）
+- [x] 🟢 定义 `.proto`：Raft（RequestVote / AppendEntries / InstallSnapshot）+ KV（Get/Put/Append）
+- [x] 🟢 gRPC transport 实现传输接口（**B 方案**：proto 只在 `transport/grpc/`，raft 不 import proto；labgob 无法往返 proto 结构体，故 A 方案作废）
+- [~] 🟢 序列化 gob → protobuf：**raft wire 已是 proto**；命令载荷（Op↔[]byte）与持久化仍用 labgob（刻意，仅内部/不跨对外契约）——真正的 raftapi 命令 `[]byte` 化延后
+- [x] 🟢 **真 binary**：`cmd/raftkvd`（RaftService+KVService co-locate + reflection + slog + 落盘 `persist.FilePersister`）+ `cmd/raftkvctl`（薄客户端）。已验证：3 节点选主/复制/优雅停机 + KV put/get/version + **崩溃恢复（kill 全部重启数据还在）**
+- [x] 🟢 埋最基础的结构化日志（slog，binary 生命周期事件）
+- [x] 🟣 编写 fault interceptor（drop/delay + 「服务端处理后吞响应」）+ **L2 全部 5 场景**（`src/l2/`：选主/复制/leader crash/分区恢复/响应丢失去重）—— `-race` 稳定绿
 - [ ] ~~快照分块流式传输~~ **砍**：边际价值低，普通 InstallSnapshot 够用
 
 > **binary 不暴露 `Raft.Start`**（错的层，绕过去重/重定向/状态机）。Phase 1 后对外即有 gRPC KV API（Get/Put/Append）；
@@ -56,6 +56,31 @@
 - [ ] 🟢 状态机落 pebble / badger
 - [ ] 🟢 快照 = pebble snapshot / checkpoint
 
+### 设计决策（🟣 要能复述）—— 为什么 Phase 1 的 FilePersister 不够
+
+**问题**：现在 `persist.Persister.Save(raftstate, snapshot)` 是【全量 blob 原子写】——`rf.persist()`（7 个调用点）每次把 term+整条 log+votedFor 序列化成一个 blob **整体重写**。连「投一票」都要重写整条 log，是 append-only 的反面（O(log) 每次）。根因：接口只能表达「存全量」，表达不了「追加一条」。
+
+**Raft 持久化的三类数据，写模式完全不同**：
+| 数据 | 写模式 | 存法 |
+|------|--------|------|
+| 元数据 term/votedFor | 覆盖、极小、频繁 | 小文件原地覆盖 |
+| **log entries** | **追加为主** + 偶尔截尾 + 快照丢前缀 | **append-only WAL** ← 命门 |
+| snapshot（KV 状态机） | 大、偶发 | 独立文件/checkpoint（→ LSM） |
+
+**方案 A（选它，真 WAL）**：把 `Save(blob)` 换成按操作分开的接口
+`SaveMeta(term,vote)` / `AppendLog(entries)` / `TruncateSuffix(from)` / `Compact(upto,snap)` / `Load()`，
+然后把 7 个 `rf.persist()` **逐点替换成对应的那一个调用**（投票只 `SaveMeta`、`Start` 只 `AppendLog`、冲突才 `TruncateSuffix`……）。
+方案 B（etcd 级：append-only record WAL + 重放 + 段轮转/压缩）当白板延伸题，本项目过度。
+
+**保住 L1 的手法（关键）**：raft 依赖新接口，给**两份实现**——
+- **adapter over `tester.Persister`**（L1 用）：新接口全部落到「更新内存全量模型 → 调旧 `Save(整blob)`」，**行为逐字节等于今天**；必须 wrap `tester.Persister`（durable 字节跨重启活在它里面，崩溃恢复才成立）。
+- **fileWAL**（binary 用）：真 append-only + fsync。
+→ L1 走 adapter，测的是**算法**；真 WAL 的 append/truncate/compact/fsync 正确性**自己单测** + binary 级 kill-all-重启对账。
+
+**fsync 纪律**：`AppendLog` fsync 后才算持久化、且**在 commitIndex 推进之前**；快照 fsync 后再删 log 前缀（顺序不能反）。
+
+**改造纪律**：先扩接口 → 逐个 persist 调用点替换 → **每步跑 raft1/kvraft1 全回归**，别一把梭（关键路径）。
+
 ---
 
 ## Phase 3 · Docker + k8s 部署
@@ -70,6 +95,12 @@
 - [ ] 🟢 readiness / liveness 探针（基础版即可）
 - [ ] 🟣 优雅停机（停机前 leadership transfer）
 - [ ] 🟢 服务发现 / 集群引导（bootstrap）
+- [ ] 🟣 **拆分 peer / client 两个平面**（Phase 1 是 co-locate 的简化，这里落地生产级分界）
+  - 独立 listener/端口（etcd 式 peer `:2380` / client `:2379`）
+  - 起因：① TLS 信任域不同（peer mTLS vs client TLS）② 网络暴露/NetworkPolicy 不同（peer 内网 only）③ 资源隔离（client 洪峰不能饿死 raft 心跳 → 误选举）
+  - 连带：`transport/grpc.ClientEnd` 跟着拆（一条 conn 到不了两个端口，raftCli/kvCli 不再捆一起）
+  - **同时做**：KV 平面的 `Call` 统一成收 kv 的 Go 结构体（对称 Raft 平面，当前仍传 proto）
+  - **必答题延伸**：为什么 etcd 分 `2379`/`2380`？（就是上面①②③）
 
 > **必答题**：为什么 Raft 节点用 StatefulSet 不用 Deployment？
 > （StatefulSet 提供稳定网络标识 + 持久化存储，Pod 重启后名字和数据不变，节点靠固定身份重新加入集群；Deployment 的 Pod 名随机变，节点找不到彼此。）

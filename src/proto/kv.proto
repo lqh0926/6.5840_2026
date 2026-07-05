@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "6.5840/proto";
+
+// Err mirrors the Go-side rpc.Err type.
+enum Err {
+  ERR_UNSPECIFIED  = 0;
+  OK               = 1;
+  ERR_NO_KEY       = 2;
+  ERR_VERSION      = 3;
+  ERR_MAYBE        = 4; // synthesized by Clerk only; servers never return this
+  ERR_WRONG_LEADER = 5;
+  ERR_WRONG_GROUP  = 6;
+}
+
+// Get RPC — linearizable read.
+message GetArgs {
+  string key = 1;
+}
+
+message GetReply {
+  string value   = 1;
+  uint64 version = 2;
+  Err    err     = 3;
+}
+
+// Put RPC — CAS write: applies only if server-side version matches.
+message PutArgs {
+  string key     = 1;
+  string value   = 2;
+  uint64 version = 3; // client's expected version; 0 = create-if-missing
+}
+
+message PutReply {
+  Err err = 1;
+}
+
+// Append RPC — non-idempotent append (Get→CAS Put loop on server side).
+// Resends after uncertainty degrade to at-most-once + ErrMaybe.
+message AppendArgs {
+  string key   = 1;
+  string value = 2; // value to append
+}
+
+message AppendReply {
+  Err    err     = 1;
+  string value   = 2; // new value after append
+  uint64 version = 3; // new version after append
+}
+
+// KV is the client-plane gRPC service (client → leader).
+service KV {
+  rpc Get(GetArgs)       returns (GetReply);
+  rpc Put(PutArgs)       returns (PutReply);
+  rpc Append(AppendArgs) returns (AppendReply);
+}

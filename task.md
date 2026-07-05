@@ -129,7 +129,7 @@
   - 验收：`go build` 出 `raftkvd`，3 进程能选主 + 复制，`grpcurl` 调 KV Put/Get 通
 - [ ] 🟣 编写 fault interceptor（可编程注入 drop/delay/error）— 测试策略 L2
 - [ ] 🟣 L2 测试：定义 `Cluster` 接口 + `labrpcCluster`/`grpcCluster` 两实现，搬 5 个关键场景（选主/复制/分区恢复/leader crash/响应丢失去重）
-- [ ] 🟢 `scripts/run-local-cluster.sh`：本地多进程起 3 个 `raftkvd`（临时脚手架）
+- [x] 🟢 `scripts/run-local-cluster.sh`：本地多进程起 N 个 `raftkvd`（默认 3；`N=5`/`--clean` 可选；构建+起集群+打印用法+trap 清理；已端到端验证 put/get 通）
 - [ ] ~~快照分块流式传输~~ **砍**：普通 InstallSnapshot 够用
 
 ---

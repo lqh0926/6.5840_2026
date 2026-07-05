@@ -7,7 +7,10 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
+	"6.5840/persist"
+	"6.5840/raftapi"
 	tester "6.5840/tester1"
+	"6.5840/transport"
 )
 
 type kvEntry struct {
@@ -151,4 +154,25 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 
 func NewServer(tc *tester.TesterClnt, ends []*labrpc.ClientEnd, grp tester.Tgid, srv int, persister *tester.Persister) []any {
 	return StartKVServer(ends, Gid, srv, persister, tester.MaxRaftState)
+}
+
+// StartKVServerGrpc 是 StartKVServer 的 gRPC/生产版：用 transport.ClientEnd +
+// 稳定 NodeID + 落盘 Persister 装配，供真 binary（cmd/raftkvd）使用。
+// 返回 KVServer 以及其内部 raft（binary 用它挂 RaftService peer 平面）。
+// labrpc 老路 StartKVServer 保持不变，L1 测试不受影响。
+func StartKVServerGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID, persister persist.Persister, maxraftstate int) (*KVServer, raftapi.Raft) {
+	labgob.Register(rsm.Op{})
+	labgob.Register(rpc.PutArgs{})
+	labgob.Register(rpc.GetArgs{})
+	labgob.Register(kvEntry{})
+	labgob.Register(Snapshot{})
+
+	kv := &KVServer{}
+	kv.kvMap = make(map[string]kvEntry)
+	kv.rsm = rsm.MakeRSMGrpc(ends, me, nodeIDs, persister, maxraftstate, kv)
+	// persist.Persister 接口没有 SnapshotSize；用 ReadSnapshot 长度判断。
+	if len(persister.ReadSnapshot()) > 0 {
+		kv.Restore(persister.ReadSnapshot())
+	}
+	return kv, kv.rsm.Raft()
 }

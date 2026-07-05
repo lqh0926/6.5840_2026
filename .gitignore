@@ -1,2 +1,5 @@
 pkg/
 *-handin.tar.gz
+
+# 本地集群脚手架产物（scripts/run-local-cluster.sh）
+.cluster/
