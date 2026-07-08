@@ -45,16 +45,21 @@
 
 ---
 
-## Phase 2 · 真持久化（LSM）⭐深度收尾
+## Phase 2 · 存储层重做：Raft WAL（真持久化）+ 状态机落磁盘（LSM）⭐深度收尾
 
-> 面试深挖区，必须吃透。
-> 验收：单节点崩溃恢复正确；原持久化相关测试绿。
+> 面试深挖区，必须吃透。**两条互不相干的轴，别塞进"持久化"一个词：**
+> - **WAL（Raft log/meta）= 真持久化，命门、承重正确性**：append-only + fsync，崩溃后靠它对账重建。
+> - **LSM（KV 状态机）= 存储模型，与持久化/正确性无关**：把 kvstate 从「内存 map」换成「磁盘结构」，
+>   让状态可 > RAM（对标 etcd 的 bbolt / TiKV 的 RocksDB）。状态机 durability **不承重正确性**——
+>   真值永远是「log + snapshot」，状态机丢了能重建；所以它不是"持久化"，是"内存模型→磁盘模型"。
+> 验收：单节点崩溃恢复正确（靠 WAL）；原持久化相关测试绿。
 
 - [ ] 🟣 实现 WAL：currentTerm / votedFor / log entries，正确的 fsync 纪律
 - [ ] 🟣 崩溃恢复测试（kill -9 后重启对账）—— 这是命门，自己想清楚
 - [ ] 🟣 拆分存储：Raft log/metadata（WAL，append-only + fsync）与 KV 状态机分开
-- [ ] 🟢 状态机落 pebble / badger
-- [ ] 🟢 快照 = pebble snapshot / checkpoint
+- [ ] 🟢 状态机落 pebble：内存 map → 磁盘 LSM（capacity > RAM），**存储模型改造、非持久化诉求**
+- [ ] 🟢 appliedIndex 与 KV 写入同一 batch 原子提交（two-WAL 协调，落盘状态机唯一真深的点）
+- [ ] 🟢 快照：本地压缩只推 appliedIndex 水位；InstallSnapshot 收到 = 整库替换（快照无 tombstone，不能 merge）
 
 ### 设计决策（🟣 要能复述）—— 为什么 Phase 1 的 FilePersister 不够
 

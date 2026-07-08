@@ -1,14 +1,12 @@
 package raft
 
 import (
-	"bytes"
 	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"6.5840/labgob"
 	"6.5840/persist"
 	"6.5840/raftapi"
 	"6.5840/transport"
@@ -47,6 +45,7 @@ type Raft struct {
 	mu        sync.Mutex
 	peers     []transport.ClientEnd
 	persister persist.Persister
+	wal       WAL // 语义化持久化契约；Step-1 是 persisterWAL（包住 persister）
 	me        transport.NodeID
 
 	// Persistent state
@@ -101,36 +100,10 @@ func (rf *Raft) logAt(absIdx int) LogEntry {
 }
 
 // --- Persistence ---
-
-func (rf *Raft) persist() {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.term)
-	e.Encode(rf.logs)
-	e.Encode(rf.voteFor)
-	e.Encode(rf.snapshotIndex)
-	rf.persister.Save(w.Bytes(), rf.snapshot)
-}
-
-func (rf *Raft) readPersist(data []byte) {
-	if len(data) < 1 {
-		return
-	}
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var term int
-	var logs []LogEntry
-	var voteFor transport.NodeID
-	var snapshotIndex int
-	if d.Decode(&term) != nil || d.Decode(&logs) != nil ||
-		d.Decode(&voteFor) != nil || d.Decode(&snapshotIndex) != nil {
-		log.Fatalf("Failed to read persisted state")
-	}
-	rf.term = term
-	rf.logs = logs
-	rf.voteFor = voteFor
-	rf.snapshotIndex = snapshotIndex
-}
+//
+// 持久化不再走单一 rf.persist()（全量重写），而是通过 rf.wal 的语义化方法表达增量：
+// 元数据用 SaveMeta、追加用 AppendLog、冲突截尾用 TruncateSuffix、快照用 SaveSnapshot。
+// 编解码与适配器实现见 wal.go。
 
 func (rf *Raft) PersistBytes() int {
 	rf.mu.Lock()
@@ -156,7 +129,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.logs = append(logs, rf.logs[rf.relIdx(index)+1:]...)
 	rf.snapshotIndex = index
 	rf.snapshot = snapshot
-	rf.persist()
+	rf.wal.SaveSnapshot(rf.snapshotIndex, rf.logs[0].Term, rf.snapshot, rf.logs[1:])
 }
 
 // --- RPC types ---
@@ -181,7 +154,7 @@ func (rf *Raft) stepDown(newTerm int) {
 	rf.leaderId = ""
 	rf.voteFor = ""
 	rf.voteCount = 0
-	rf.persist()
+	rf.wal.SaveMeta(rf.term, rf.voteFor)
 }
 
 // --- RPC handlers ---
@@ -206,7 +179,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if (rf.voteFor == "" || rf.voteFor == args.CandidateId) && logOk {
 		rf.voteFor = args.CandidateId
-		rf.persist()
+		rf.wal.SaveMeta(rf.term, rf.voteFor)
 		select {
 		case rf.resetCh <- struct{}{}:
 		default:
@@ -259,7 +232,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntries, reply *AppendEntriesRe
 		}
 		rf.snapshotIndex = args.SnapshotIndex
 		rf.commitIndex = max(rf.commitIndex, rf.snapshotIndex)
-		rf.persist()
+		rf.wal.SaveSnapshot(rf.snapshotIndex, rf.logs[0].Term, rf.snapshot, rf.logs[1:])
 
 		reply.Term = rf.term
 		reply.Success = true
@@ -314,7 +287,9 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntries, reply *AppendEntriesRe
 		if i < len(args.Entries) {
 			logIdx := args.PrevLogIndex + 1 + i
 			rf.logs = append(rf.logs[:rf.relIdx(logIdx)], args.Entries[i:]...)
-			rf.persist()
+			// 冲突：先截掉 logIdx 起的旧尾巴，再追加新条目（两步复现这一行 in-place 覆盖）。
+			rf.wal.TruncateSuffix(logIdx)
+			rf.wal.AppendLog(args.Entries[i:])
 		}
 		// i == len(args.Entries)：全部已存在且一致，无需操作
 	}
@@ -432,8 +407,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.term, false
 	}
 	index := rf.lastLogIndex() + 1
-	rf.logs = append(rf.logs, LogEntry{Command: command, Term: rf.term})
-	rf.persist()
+	entry := LogEntry{Command: command, Term: rf.term}
+	rf.logs = append(rf.logs, entry)
+	rf.wal.AppendLog([]LogEntry{entry})
 	// Signal heartbeat goroutine to replicate immediately instead of waiting
 	// for the next 100ms tick.
 	select {
@@ -456,7 +432,7 @@ func (rf *Raft) startElection() {
 	rf.customerId = Candidate
 	rf.voteFor = rf.me
 	rf.voteCount = 1
-	rf.persist()
+	rf.wal.SaveMeta(rf.term, rf.voteFor)
 	lastIdx := rf.lastLogIndex()
 	lastTerm := rf.logs[len(rf.logs)-1].Term
 	term := rf.term
@@ -638,8 +614,17 @@ func Make(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.
 		nodeIndex:  nodeIndex,
 	}
 
-	rf.readPersist(persister.ReadRaftState())
-	rf.snapshot = persister.ReadSnapshot()
+	rf.wal = newPersisterWAL(persister)
+	if st, ok := rf.wal.Load(); ok {
+		rf.term = st.Term
+		rf.logs = st.Logs
+		rf.voteFor = st.Vote
+		rf.snapshotIndex = st.SnapshotIndex
+		rf.snapshot = st.Snapshot
+	} else {
+		// 全新节点：raftstate 为空，但快照可能独立存在（与改造前无条件 ReadSnapshot 一致）。
+		rf.snapshot = st.Snapshot
+	}
 
 	rf.resetCh = make(chan struct{}, 1)
 	rf.newEntryCh = make(chan struct{}, 1)

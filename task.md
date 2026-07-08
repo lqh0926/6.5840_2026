@@ -1,139 +1,188 @@
-# Phase 0 · 抽象层 — 实现任务
+# Phase 2 · 存储层重做：Raft WAL + 状态机落磁盘（LSM）— 实现任务
 
-> 总验收：`make lab3a/3b/3c/3d` 及 raft/kv 全部原测试照旧绿（含 `-race`）。
-> 原则：每一步独立可编译、可测；不动 `tester1/`，把抽象的转换收在各服务的边界处，保证回归网完整。
-
----
-
-## Step 1 · 传输抽象（RPC → 接口）✅ 完成
-
-**设计决策（🟣 要能复述）**
-- 传输接口**不依赖 raft 结构体**。传输层只负责"送一个调用、取回回复"，不懂投票/日志语义。
-- 接口签名照搬 labrpc 现有的 `Call(svcMeth string, args, reply any) bool`（泛型）。
-  - 好处 1：`*labrpc.ClientEnd` 已有此方法 → **结构化类型自动满足接口，无需适配器**。
-  - 好处 2：同一接口 raft / kvraft / shardkv 三层都能复用，非 raft 专用。
-- 为什么不用类型化接口（`RequestVote(*Args)(*Reply)`）：会让接口 import raft 结构体，而 raft 又要 import 接口 → **import 循环**。且现 `RequestVoteArgs`/`AppendEntries` 都定义在 `raft1/raft.go`。
-- 代价（Phase 1 还）：gRPC 是强类型 stub，泛型 `Call` 落到 gRPC 适配器里需按 `svcMeth` 做 method-name dispatch（type switch），dispatch 收在适配器内部，可接受。
-
-**改动清单**
-- [ ] 新建 `src/transport/transport.go`，包 `transport`，**不 import 任何 raft 代码**：
-  ```go
-  package transport
-
-  // ClientEnd 是对"能发起一次 RPC 调用"的最小抽象。
-  // labrpc.ClientEnd / 未来的 gRPC client 都实现它。
-  type ClientEnd interface {
-      Call(svcMeth string, args any, reply any) bool
-  }
-  ```
-- [ ] `raft1/raft.go`：
-  - 字段 `peers []*labrpc.ClientEnd` → `peers []transport.ClientEnd`
-  - `Make(peers []*labrpc.ClientEnd, ...)` → `Make(peers []transport.ClientEnd, ...)`
-  - 删掉对 `labrpc` 的 import（若 raft.go 不再直接用到）
-- [ ] `raft1/server.go`：`newRfsrv` 收到的仍是 `[]*labrpc.ClientEnd`（tester 传入，不改 tester）。
-      在调用 `Make` 前做一次 slice 转换：
-  ```go
-  peers := make([]transport.ClientEnd, len(ends))
-  for i, e := range ends { peers[i] = e }
-  ```
-  （`[]*labrpc.ClientEnd` 不能隐式转 `[]transport.ClientEnd`，必须显式循环）
-
-**验收**
-- [ ] `go build ./...` 通过
-- [ ] `go test ./raft1/`（3A–3D）全绿
-- [ ] `go test -race -run TestInitialElection3A ./raft1/` 绿（抽样确认 race 干净）
+> 面试深挖区，必须吃透。**这里是两条互不相干的轴，别塞进"持久化"一个词：**
+> - **WAL（Raft log/meta）= 真持久化，命门、承重正确性**：append-only + fsync，崩溃后靠它对账重建。
+> - **LSM（KV 状态机）= 存储模型，与持久化/正确性无关**：把 kvstate 从「内存 map」换成「磁盘结构」，
+>   让状态可 > RAM（对标 etcd 的 bbolt / TiKV 的 RocksDB）。状态机 durability **不承重正确性**——
+>   真值永远是「log + snapshot」，状态机丢了能重建；所以它不是"持久化"，是"内存模型→磁盘模型"。
+>
+> 总验收：① raft1 / kvraft1 全部原测试照旧绿（含 `-race`）；② 真 WAL 自己单测通过；
+> ③ binary 级 kill-all-重启对账正确（数据不丢、不错）。
+> 核心纪律：**先扩接口 → 逐个 persist 调用点替换 → 每步跑 raft1/kvraft1 全回归**，别一把梭。
 
 ---
 
-## Step 2 · 节点寻址抽象（int 下标 → NodeID + 地址映射）✅ 完成
+## 现状（改造起点）
 
-> `ClientEnd` 解决"怎么调"，`NodeID` 解决"调谁"。两者配套。
+- `persist.Persister` 只有 `Save(raftstate, snapshot)` —— **全量 blob 原子写**语义。
+- `raft.persist()`（`raft1/raft.go:105`）每次把 `term + 整条 logs + voteFor + snapshotIndex`
+  用 labgob 打包，连同 `snapshot` **整体重写**。连"投一票"都要重写整条 log（O(log) 每次）。
+- 全代码里 **只有 7 个 `rf.persist()` 调用点**，但每个的真实写意图只碰一小块。
+- 已有两个实现：`tester.Persister`（内存，L1 测试用）、`persist.FilePersister`（bundle 文件，binary 用）。
 
-- [ ] 定义稳定 `NodeID`（string，如 `"n1"`），与传输地址解耦
-- [ ] raft 内部 peer 标识从 `int` 下标过渡到 `NodeID`（先做映射层，labrpc 仍按下标）
-- [ ] 评估对 `me int`、`matchIndex/nextIndex` 等下标数组的影响（这里改动面较大，单列一步）
-- [ ] 验收：原测试绿
+### 7 个 persist() 调用点 → 新接口映射（拆接口的地基）
 
----
+| # | 位置 | 触发场景 | 实际改了什么 | 应落到的新接口 |
+|---|------|----------|--------------|----------------|
+| 1 | `raft.go:159` | `Snapshot()` | 裁 log 前缀 + 设 snapshot/snapshotIndex | **Compact**(upto, snap) |
+| 2 | `raft.go:184` | `stepDown()` | term / voteFor="" | **SaveMeta**(term, vote) |
+| 3 | `raft.go:209` | RequestVote 授票 | voteFor = candidate | **SaveMeta** |
+| 4 | `raft.go:262` | InstallSnapshot handler | snapshotIndex + 裁 log 前缀 | **Compact** |
+| 5 | `raft.go:317` | AppendEntries 冲突 | 截尾冲突 suffix + append 新 entries | **TruncateSuffix** + **AppendLog** |
+| 6 | `raft.go:436` | `Start()` | append 一条 entry | **AppendLog**(entries) |
+| 7 | `raft.go:459` | `startElection()` | term++ / voteFor=self | **SaveMeta** |
 
-## Step 3 · 持久化抽象（Persister → 接口）✅ 完成
-
-- [ ] 把 `*tester.Persister` 抽到 `Persister` 接口背后，内存实现作为其一
-- [ ] raft.go 中 `persister.Save/ReadRaftState/RaftStateSize` 走接口
-- [ ] 验收：原测试绿（持久化相关 3C/3D 重点跑）
-
----
-
-## Step 4 ~~真 binary~~ → 移至 Phase 1
-
-> **决策**：binary 不是独立产物，它就是 gRPC server 的宿主进程。
-> labrpc 是进程内模拟网络，两个 OS 进程无法用它通信——binary 必须有跨进程的真传输（gRPC）才有意义。
-> 故 binary 与 Phase 1 的 gRPC 一起落地，Phase 0 收口在 Step 3。
-
-**Phase 0 ✅ 全部完成（Step 1–3）。**
+> 观察：7 点里 **3 个只碰元数据**（2/3/7），**2 个只碰 log 追加/截尾**（5/6），**2 个是快照压缩**（1/4）。
+> 现在它们全走"重写整条 log"的 `Save`，这就是要拆的根因——接口只能表达"存全量"，表达不了"追加一条"。
 
 ---
 
-# Phase 1 · 真 RPC（gRPC + protobuf）
+## 设计决策（🟣 要能不看代码复述）
 
-> 验收：labrpc 测试（L1 回归网）+ gRPC loopback 测试都绿。
+### 决策 1 · 为什么要扩接口，而非在 FilePersister 内部优化
+`Save(blob)` 只拿到整块字节，**看不到增量**（哪几条是新 append、从哪截尾）。
+真 append-only WAL 的前提是接口能表达"只追加这一条"。所以必须**把 `Save` 拆成按操作分开的方法**，
+raft 在每个调用点告诉存储层"我这次到底干了什么"，存储层才能只 append 而非全量重写。
 
-## 设计决策 A · 进程架构（🟣 要能复述）
+### 决策 2 · 新接口（方案 A，真 WAL；方案 B 段轮转当白板延伸题）
+```go
+type WAL interface {
+    SaveMeta(term int, vote NodeID)      // 覆盖、极小、频繁 → 小文件原地覆盖
+    AppendLog(entries []LogEntry)        // 追加为主 → append-only + fsync ← 命门
+    TruncateSuffix(fromIndex int)        // 冲突截尾（丢尾部）
+    Compact(uptoIndex int, snap []byte)  // 快照 + 丢 log 前缀
+    Load() (State, error)                // 启动重放/恢复
+}
+```
+> 签名以实现时最终为准，`LogEntry`/`NodeID` 复用 raft1/transport 现有类型。
+> `SaveMeta` 独立小文件覆盖，不进 WAL（WAL 是 append-only，覆盖语义放这里是污染）。
 
-- **两个二进制，职责分离**：
-  - `raftkvd`（server）：跑节点 = Raft + KV 状态机，暴露 gRPC。**自身不带发起操作的 CLI**。N 个 = 集群。
-  - `raftkvctl`（client，独立，可选）：薄 gRPC client，对外戳集群用；或直接 `grpcurl`。
-  - server 的"对外接口"就是它的 gRPC KV service。client 与 server 都走 gRPC。
-- **两个通信平面**（都走 gRPC/TCP）：
-  - Peer 平面（Raft）：node↔node，RequestVote/AppendEntries/InstallSnapshot
-  - Client 平面（KV）：client→leader，Get/Put/Append
-  - 注：测试里的"进程内通信"是 labrpc 的 channel（L1 回归层用），跟生产的 gRPC/TCP 是两套，别混。
-- **配置：一个 Config struct，来源可切换**。`NodeID`/`ListenAddr`/`Peers`(NodeID→addr)/`DataDir`。本地用「共享 peer map 配置文件 + 每进程 `--node-id` 选'我是谁'」；Phase 3 进 k8s 换成 env/configmap，**struct 不变**。本地多进程靠 `scripts/run-local-cluster.sh` 起 3 个 `raftkvd`（临时脚手架，Phase 3 升级成 docker-compose，别在它上雕花）。
-- **不暴露 `Raft.Start` 作对外/CLI 接口**——错的层：裸 submit 绕过去重 `(clientId,seq)`、leader 重定向、状态机语义。Start 永远留在 KV 层内部，不出包。
-- Phase 1 之后**已经有对外 API**，只是 gRPC 的（`.proto` 含 KV Get/Put/Append）。REST（Phase 4）是其上的 HTTP 门面，不是"现在没接口"。验端到端优先 `grpcurl` 调 KV Put/Get（零代码）。
+### 决策 3 · 两份实现，保住 L1（关键）
+raft 依赖新接口，给**两份实现**：
+- **`adapter over tester.Persister`（L1 用）**：新接口每个方法都落到
+  「更新内存里的全量模型 → 调旧 `Save(整 blob)`」，**行为逐字节等于今天**。
+  必须 wrap `tester.Persister`（durable 字节跨重启活在它里面，崩溃恢复才成立）。
+  → L1 测的是**算法正确性**，不测 WAL。
+- **`fileWAL`（binary 用）**：真 append-only record + fsync + 重放。
+  → 它的 append/truncate/compact/fsync 正确性**自己单测** + binary 级 kill-all-重启对账。
 
-## 设计决策 B · 测试分层（🟣 要能复述）
+> 为什么不让 L1 直接跑 fileWAL：L1 焊死 labrpc + 内存模型是确定性回归网，
+> 引入真磁盘 I/O 会让回归变慢变脆；WAL 正确性用专门单测 + binary 对账，职责分离。
 
-**不"移植"原测试，要分层。** `tester1/config.go` 里 `net *labrpc.Network` 焊死，全部故障注入（Reliable/LongReordering/LongDelays/分区）走 labrpc.Network——强搬成本高且更不稳。
+### 决策 4 · fsync 纪律（命门，面试必答）
+- `AppendLog` **fsync 成功后才算持久化**，且**必须在 commitIndex 推进之前**
+  （否则 leader 认为已提交、崩溃后 log 却没落盘 → 丢已提交数据）。
+- `Compact`：**snapshot fsync 成功后，再删 log 前缀**（顺序不能反，否则崩在中间 → 前缀和快照都没了）。
+- `TruncateSuffix`：截尾要持久化后才能接受更前的新 entries。
+- 元数据（term/vote）覆盖写也要 fsync 后才算数（投票持久化是不重复投票的地基）。
 
-- **L1 — 原测试一行不改，继续跑 labrpc**。Phase 0 已把传输抽成 `transport.ClientEnd`，labrpc 只是其一实现；原测试通过接口跑，**不碰 gRPC**。这是主回归网（全覆盖 + `models1/` 线性化检查），负责"复现和调试"。
-- **L2 — 新写精简 gRPC harness，只搬 5 个关键场景**：初始选主 / 日志复制 / 分区恢复 / leader crash / **响应回程丢失的去重**（labrpc 造不出，L2 独有价值）。不复用 tester1。
-- **共享场景逻辑靠 `Cluster` 接口**（中间路径）：场景 = 一串"操作+断言"，与底座无关；把动作抽成接口，场景写一遍，接口实现两份。
-  ```go
-  type Cluster interface {
-      Leader() NodeID
-      Disconnect(NodeID); Connect(NodeID)
-      Put(k, v string) error; Get(k string) (string, error)
-  }
-  // 场景写一次，针对接口：
-  func ScenarioPartitionRecovery(t *testing.T, c Cluster) { ... }
-  // 实现两份：labrpcCluster.Disconnect 调 net.Disconnect；
-  //          grpcCluster.Disconnect 调 fault interceptor 的 DropTo
-  // 调用：ScenarioX(t, newLabrpcCluster(5)) / ScenarioX(t, newGrpcCluster(5))
-  ```
-  **只对这 5 个场景做，别让全套 6.5840 测试跑这接口**（tester1 焊死 labrpc，参数化亏；gRPC 故障注入不如 labrpc 确定，跑全套回归更不稳）。
-- L2 故障注入：labrpc 的 `net.Disconnect` 没了，改用 **gRPC interceptor** 编程注入 drop/delay/error。
-- 一句话：**场景逻辑与传输解耦（`Cluster` 抽象）；全量回归留确定性的 labrpc 层，gRPC 层只验迁移正确性 + 它独有的失败模式（服务端已处理、响应丢、客户端只见 timeout）。**
+### 决策 5 · Raft log 与 KV 状态机分离存储（翻车陷阱 #1）
+- Raft log/metadata → WAL（append-only 高频小写 + fsync）。
+- KV 状态机 → LSM（pebble），独立目录。
+- 二者写模式完全不同（log 高频顺序追加 vs 状态机随机点查/范围扫），混存互相拖累。这是分离目标。
 
-## 任务
+### 决策 6 · LSM 的价值 = 存储模型（内存→磁盘），不是持久化（🟣 面试防坑）
 
-- [ ] 🟢 定义 `.proto`：Raft（RequestVote / AppendEntries / InstallSnapshot）+ KV（Get/Put/Append）
-- [ ] 🟢 gRPC transport 实现 `transport.ClientEnd` 接口
-  - 泛型 `Call(svcMeth, args, reply)` 落到 gRPC 适配器里按 `svcMeth` 做 method-name dispatch（type switch），dispatch 收在适配器内部
-- [ ] 🟢 序列化 gob → protobuf（顺带拿到 schema 演进能力）
-- [ ] 🟢 **真 binary**（原 Phase 0 Step 4）：`cmd/raftkvd` main 包
-  - flag/env 配置加载：`--node-id` / `--listen` / `--peers`(NodeID→addr) / `--data-dir`
-  - 起 gRPC server，挂 Raft handler + KV service；用 gRPC transport + 落盘 Persister 引导节点
-  - 跑到 SIGTERM，优雅停机（leadership transfer 留到 Phase 3）
-  - 结构化日志：slog（标准库零依赖，优先于 zap）
-  - 验收：`go build` 出 `raftkvd`，3 进程能选主 + 复制，`grpcurl` 调 KV Put/Get 通
-- [ ] 🟣 编写 fault interceptor（可编程注入 drop/delay/error）— 测试策略 L2
-- [ ] 🟣 L2 测试：定义 `Cluster` 接口 + `labrpcCluster`/`grpcCluster` 两实现，搬 5 个关键场景（选主/复制/分区恢复/leader crash/响应丢失去重）
-- [x] 🟢 `scripts/run-local-cluster.sh`：本地多进程起 N 个 `raftkvd`（默认 3；`N=5`/`--clean` 可选；构建+起集群+打印用法+trap 清理；已端到端验证 put/get 通）
-- [ ] ~~快照分块流式传输~~ **砍**：普通 InstallSnapshot 够用
+**别把 Step 4 讲成"给状态机补持久化"——那是错的，也不影响正确性。** 正确框架：
+
+- **状态机的 durability 不承重正确性**：Raft 保证状态机永远能从「持久化的 log + 持久化的 snapshot」
+  重建。状态机在内存 map（崩了丢、重建）还是在 pebble（崩了还在、但也可以丢了重建）——正确性一样。
+  真值（source of truth）是 log+snapshot，状态机存储只是它俩的一个物化视图。
+- **pebble 的唯一实义 = 把 kvstate 从「内存模型」变成「磁盘模型」**：状态可以大于 RAM，冷数据在盘、
+  热集在 block cache。对标 etcd（bbolt）/ TiKV（RocksDB）。这是**容量/存储模型**问题，不是持久化。
+- **"快照"的两条路要分清**（否则会得出"pebble 没用"的错误结论）：
+  | | 本地压缩（高频、纯本地） | InstallSnapshot RPC（罕见、走网络） |
+  |---|---|---|
+  | blob 方案 | 每次全量重序列化整个 map | 传输 O(数据集) + 接收方整块解码重建 |
+  | pebble 方案 | 只推 appliedIndex 水位 + 砍 log 前缀，**不重序列化** | **一样** O(数据集)，谁都逃不掉 |
+  pebble 的好处全在**本地压缩**这条高频路；InstallSnapshot 那条本就罕见、且任何引擎都是全量重建。
+- **一个真 gotcha（面试可讲）**：快照是 live key 镜像、**不带删除（tombstone）**，所以把收到的
+  InstallSnapshot 装进一个已有数据的 pebble 时**不能 merge**（旧 key 不会被"删"掉）——只能**整库替换**
+  （另建 pebble 灌满 → 原子换掉旧的）。TiKV region snapshot 即此做法。
+- **成本诚实**：lab 数据量下这些好处都看不到（map 小、重序列化不要钱）→ Step 4 在本项目是**纯深度演示**，
+  不是功能刚需。保留它的理由是"面试深挖区、把上面这套讲清"，不是"项目需要它"。工作量很小（换个后端）。
 
 ---
 
-## 备注
-- 每步保持"原测试照旧绿"为硬门槛（L1 回归网），任一步骤打破立即停。
-- gRPC 多一种 labrpc 没有的故障：服务端已处理、响应回程丢失 → 客户端只看到 timeout。这是 `(clientId,seq)` 去重的核心场景，靠 L2 interceptor 精准构造。
+## Step 1 · 扩接口 + adapter（不碰真 WAL，先保 L1 绿）✅ 完成
+
+> 目标：把 7 个 `rf.persist()` 换成语义化调用，但底座仍是"更新全量模型→旧 Save"，
+> **行为逐字节不变**。这一步跑通即证明"接口拆得对、映射对"，是最安全的第一步。
+
+**实现记录**
+- `raft1/wal.go`：`WAL` 接口（`SaveMeta`/`AppendLog`/`TruncateSuffix`/`SaveSnapshot`/`Load`）+
+  `PersistState` + `persisterWAL` 适配器 + 唯一编码真源 `encodeRaftState`/`decodeRaftState`。
+  - **接口放 `raft1` 包**（不放 `persist/`）：接口引用 `LogEntry`（raft 类型），若放 persist 会
+    `persist→raft1→persist` 循环。真 fileWAL（Step 3）在独立包实现 `raft1.WAL` 并 import raft1，
+    raft1 靠依赖注入拿实现、不反向 import，无环。
+  - **接口只 5 个方法（非 6）**：InstallSnapshot 与服务层 Snapshot 结果形态一致
+    （`[哨兵]+suffix`），差异仅在 sentinelTerm/suffix 由调用点算好传入 → 用一个 `SaveSnapshot`
+    统一，不在持久化层重推两套日志变换。两处调用点因此是**同一行** `SaveSnapshot(idx, logs[0].Term, snap, logs[1:])`。
+  - adapter 关键正确性：① 构造时从底层 seed 全量模型（否则首写用空 logs 覆盖磁盘）；
+    全新节点 seed 哨兵 `[{Term:0}]` 与 Make 字面量一致。② `SaveSnapshot` 复制 suffix（传入是
+    `rf.logs[1:]`，与 rf 共享底层数组，不复制会被 rf 后续改动污染）。
+- `raft1/raft.go`：加 `wal WAL` 字段；删 `persist()`/`readPersist()`；7 个调用点逐一替换；
+  Make 启动读走 `wal.Load()`。site5（冲突）= `TruncateSuffix(logIdx)` + `AppendLog(entries)` 两步。
+
+**验收**（全部通过）
+- [x] `go build ./raft1/... ./kvraft1/... ./shardkv1/...`（`main/` 旧 lab 的报错是既有、无关）
+- [x] `go test -race ./raft1/` 全绿（3A–3D 含持久化/快照）—— `ok 416.5s`
+- [x] `go test -race ./kvraft1/` 全绿（4A/4B，重度走 SaveSnapshot）—— `ok 271.4s`
+- [ ] （可选加固）`make RUN=... shardkv` 抽样，确认 rsm→raft 持久化路径无碍
+
+## Step 2 · 崩溃恢复单测（命门，自己想清楚）
+
+> 在换真 WAL **之前**先把对账测试写好，作为 fileWAL 的验收标尺。
+
+- [ ] 设计 kill-9-重启对账用例：随机 append/truncate/compact/saveMeta 序列 → 重启 → `Load` 结果必须等于崩溃点前"已 fsync 承诺"的状态
+- [ ] 明确不变式：已 fsync 的 AppendLog 必须在；未 fsync 的可有可无；Compact 后前缀必须不可见且 snapshot 在
+- [ ] 用文件级 fault 注入模拟"写一半崩"（截断 tmp / 中途 kill）
+
+## Step 3 · 实现 fileWAL（真 append-only + fsync + 重放）
+
+- [ ] WAL record 格式：`[len][crc][type][payload]`，type ∈ {append, truncate, meta, compact-marker}
+- [ ] `AppendLog`：seek 到尾追加 record → fsync；`Load` 顺序重放 records 重建 log
+- [ ] `TruncateSuffix`：写一条 truncate record（重放时逻辑截尾），不物理改历史
+- [ ] `SaveMeta`：独立 `meta` 小文件原子覆盖（tmp→fsync→rename→fsync dir），不进 WAL
+- [ ] `Compact`：snapshot 独立文件原子写+fsync → **后**写 compact record 丢 log 前缀（顺序！）
+- [ ] 崩溃安全：重放遇 crc 失败 / 半截 record → 在最后一条完整 record 处截断（尾部撕裂容忍）
+- [ ] 段轮转/压缩（避免 WAL 无限增长）—— 最简即可；etcd 级段管理当白板延伸题，别过度
+- **验收**：Step 2 的对账单测全绿（含 `-race`）
+
+## Step 4 · KV 状态机：内存 map → 磁盘 LSM（pebble）
+
+> 定位见决策 6：这是**存储模型**改造（内存→磁盘、可 > RAM），**不是持久化、不影响正确性**。
+> 本项目纯深度演示，工作量很小（换个状态机后端），价值在把决策 6 那套讲透。
+
+- [ ] `cmd/raftkvd` 的 KV 状态机后端从内存 map 换成 pebble（`transport/grpc/kv_service.go` 那层）
+- [ ] appliedIndex **与 KV 写入同一个 pebble write batch 原子提交**（two-WAL 协调：重启后知道从
+      Raft log 哪条续放；这是状态机落盘唯一真正深的点）
+- [ ] 快照：本地压缩只推 appliedIndex 水位 + 砍 Raft log 前缀；InstallSnapshot 的 wire 镜像按需产出
+- [ ] **收到 InstallSnapshot = 整库替换**（另建 pebble 灌满 → 原子换旧的），不能 merge（快照无 tombstone）
+- [ ] Raft log(WAL) 与 KV 状态机(pebble) **物理分目录**（决策 5）
+- [ ] go.mod 引入 pebble；评估依赖体积（可接受，行业标准）
+- **验收**：binary kill-all-重启，KV 数据 + raft log 都在，put/get/version 一致；数据集 > RAM 也能服务
+
+## Step 5 · binary 级端到端对账（最终验收）
+
+- [ ] `scripts/run-local-cluster.sh` 起 3 节点 → 写入若干 KV → `kill -9` 全部 → 重启
+- [ ] 校验：leader 重新选出、log 无丢失、KV 全部命中、version 单调
+- [ ] 覆盖：leader 崩 / follower 崩 / 全崩三种
+
+---
+
+## 验收总表（每步的硬门槛）
+
+| Step | 硬门槛 |
+|------|--------|
+| 1 | raft1(3A-3D)+kvraft1(4A/4B) 全绿含 `-race`，行为逐字节等于改造前 |
+| 2 | 崩溃对账单测覆盖 append/truncate/compact/meta + 撕裂尾部 |
+| 3 | fileWAL 通过 Step 2 全部单测（含 `-race`） |
+| 4 | KV 状态机走 pebble（磁盘模型）、与 log 分目录；appliedIndex 与写入原子提交；重启无需重建即服务 |
+| 5 | 三种崩溃场景端到端对账通过 |
+
+## 备注 / 陷阱
+- **每步保持"原测试照旧绿"为硬门槛**（L1 回归网），任一步打破立即停、回滚该步。
+- 逐点替换 persist：**一次一个调用点**，改完立即回归，别攒着一起测（关键路径调试成本高）。
+- fsync 顺序错 = 崩溃恢复静默错数据，测试可能偶尔漏掉 → 靠 Step 2 的确定性注入兜底。
+- 方案 B（etcd 级 record WAL + 段轮转/压缩）、joint consensus、ReadIndex 都是白板延伸，本项目不写。
