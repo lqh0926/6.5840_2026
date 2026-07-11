@@ -21,12 +21,13 @@ import (
 	"strings"
 	"syscall"
 
+	"6.5840/filewal"
 	kvraft "6.5840/kvraft1"
-	"6.5840/persist"
 	"6.5840/proto"
 	raft "6.5840/raft1"
 	"6.5840/transport"
 	grpcx "6.5840/transport/grpc"
+	"6.5840/wal"
 
 	grpclib "google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -82,15 +83,18 @@ func run(cfg config, log *slog.Logger) error {
 		}
 	}()
 
-	// --- 落盘 Persister ---
-	persister, err := persist.OpenFilePersister(cfg.dataDir)
+	// --- 落盘 WAL（Phase 2：真 append-only fileWAL，替代 Phase 1 的全量 blob Persister）---
+	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir data-dir: %w", err)
+	}
+	fw, err := filewal.Open(wal.OSFS(), cfg.dataDir)
 	if err != nil {
-		return fmt.Errorf("open persister: %w", err)
+		return fmt.Errorf("open filewal: %w", err)
 	}
 
 	// --- 启动 KV 节点（内部经 rsm 创建 Raft，applyCh 喂 KV 状态机）---
-	// maxraftstate=-1：Phase 1 暂不快照（Phase 2 上 WAL/LSM 时再开）。
-	kv, rfi := kvraft.StartKVServerGrpc(ends, cfg.nodeID, nodeIDs, persister, -1)
+	// maxraftstate=-1：暂不快照（4a 上 pebble 后再开，测 SaveSnapshot 路径）。
+	kv, rfi := kvraft.StartKVServerGrpc(ends, cfg.nodeID, nodeIDs, fw, -1)
 	rf, ok := rfi.(*raft.Raft)
 	if !ok {
 		return fmt.Errorf("raft 返回类型非 *raft.Raft，无法挂 RaftService")

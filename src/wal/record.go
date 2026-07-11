@@ -85,6 +85,10 @@ func OpenRecordLog(fs FS, name string) (*RecordLog, [][]byte, error) {
 	return &RecordLog{f: f}, records, nil
 }
 
+// NewRecordLog 用一个已定位在末尾的追加句柄直接构造 RecordLog —— **不读文件、不 replay**。
+// 供"文件已知干净"（如刚 AtomicWrite 重写完）时复位追加句柄，避免全量重读整个文件。
+func NewRecordLog(f File) *RecordLog { return &RecordLog{f: f} }
+
 // Append 编码并写入 payload，fsync 成功后才返回（返回即 durable）。
 func (l *RecordLog) Append(payload []byte) error {
 	rec := appendRecord(nil, payload)

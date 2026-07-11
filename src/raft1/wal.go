@@ -34,6 +34,9 @@ type WAL interface {
 	// Load 读取已持久化状态；ok=false 表示全新节点（无持久化 raftstate）。无论 ok，
 	// 返回的 Snapshot 字段都反映底层快照（快照可独立于 raftstate 存在）。
 	Load() (st PersistState, ok bool)
+	// Size 返回已持久化 raftstate（log/元数据，不含快照）的字节数，用于 maxraftstate
+	// 触发压缩。语义等于旧 persist.Persister.RaftStateSize()。
+	Size() int
 }
 
 // PersistState 是 Load 返回的全量持久化状态。
@@ -136,6 +139,8 @@ func (w *persisterWAL) SaveSnapshot(snapshotIndex, sentinelTerm int, snapshot []
 	w.snapshot = snapshot
 	w.flush()
 }
+
+func (w *persisterWAL) Size() int { return w.p.RaftStateSize() }
 
 func (w *persisterWAL) Load() (PersistState, bool) {
 	term, logs, vote, snapshotIndex, ok := decodeRaftState(w.p.ReadRaftState())

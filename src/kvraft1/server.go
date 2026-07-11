@@ -7,7 +7,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
-	"6.5840/persist"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
 	"6.5840/transport"
@@ -160,7 +160,7 @@ func NewServer(tc *tester.TesterClnt, ends []*labrpc.ClientEnd, grp tester.Tgid,
 // 稳定 NodeID + 落盘 Persister 装配，供真 binary（cmd/raftkvd）使用。
 // 返回 KVServer 以及其内部 raft（binary 用它挂 RaftService peer 平面）。
 // labrpc 老路 StartKVServer 保持不变，L1 测试不受影响。
-func StartKVServerGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID, persister persist.Persister, maxraftstate int) (*KVServer, raftapi.Raft) {
+func StartKVServerGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID, w raft.WAL, maxraftstate int) (*KVServer, raftapi.Raft) {
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
@@ -169,10 +169,10 @@ func StartKVServerGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs 
 
 	kv := &KVServer{}
 	kv.kvMap = make(map[string]kvEntry)
-	kv.rsm = rsm.MakeRSMGrpc(ends, me, nodeIDs, persister, maxraftstate, kv)
-	// persist.Persister 接口没有 SnapshotSize；用 ReadSnapshot 长度判断。
-	if len(persister.ReadSnapshot()) > 0 {
-		kv.Restore(persister.ReadSnapshot())
+	kv.rsm = rsm.MakeRSMGrpc(ends, me, nodeIDs, w, maxraftstate, kv)
+	// 快照现由 WAL 持有（fileWAL 内嵌于 wal header）；启动时经 Load 取回做 Restore。
+	if st, _ := w.Load(); len(st.Snapshot) > 0 {
+		kv.Restore(st.Snapshot)
 	}
 	return kv, kv.rsm.Raft()
 }

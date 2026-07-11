@@ -220,32 +220,53 @@ Raft 是 **persist-before-reply**（授票/回 ack 前先落盘），所以"丢�
       （SaveMeta 写 tmp 崩 / append 写一半崩 / 压缩 rename 前后崩）→ 重启 Load 均自洽零丢失。
 - **验收**：`go test -race ./filewal/ ./wal/` 全绿（filewal 5 组、wal 12 个）；raft1/kvraft1 build 不受影响。
 
-### 还差（Step 3 收尾，单独一轮）：binary 注入
+### binary 注入 ✅ 完成
 
-- [ ] `raft.MakeWithWAL(peers, me, nodeIDs, wal, applyCh)`；`Make` 委托 `newPersisterWAL`（L1 路径不动）。
-- [ ] WAL 顺着 `StartKVServerGrpc → MakeRSMGrpc` 传下去（**只改 grpc 变体**）；`cmd/raftkvd` 构造 `filewal.Open(OSFS, dataDir)` 注入。
-- [ ] KV 层快照读：现走 `persister.ReadSnapshot()`（server.go:174），换 fileWAL 后让它经 WAL 暴露/转交。
-- [ ] 回归：raft1 / kvraft1 仍全绿（Make 老路径没动）。
+- [x] `raft.MakeWithWAL(peers, me, nodeIDs, wal, applyCh)`；`Make` 委托 `newPersisterWAL`（L1 路径不动）。
+      WAL 接口加 `Size()`（PersistBytes 走它，不再依赖 persister）；fileWAL 的 `Size()` 只算日志字节、不含内嵌快照。
+- [x] WAL 顺 `StartKVServerGrpc → MakeRSMGrpc` 传下去（**只改 grpc 变体**）；`cmd/raftkvd` 构造 `filewal.Open(OSFS, dataDir)` 注入。
+- [x] KV 层快照读：`StartKVServerGrpc` 改为 `w.Load().Snapshot` 做 Restore（不再 `persister.ReadSnapshot`）。
+- [x] 回归：`go test -race ./raft1/`（3A–3D，强制 `-count=1`）`ok 400s`；`./kvraft1/` `ok 249s`；filewal/wal 全绿。
 
 ## Step 4 · KV 状态机：内存 map → 磁盘 LSM（pebble）
 
 > 定位见决策 6：这是**存储模型**改造（内存→磁盘、可 > RAM），**不是持久化、不影响正确性**。
 > 本项目纯深度演示，工作量很小（换个状态机后端），价值在把决策 6 那套讲透。
 
-- [ ] `cmd/raftkvd` 的 KV 状态机后端从内存 map 换成 pebble（`transport/grpc/kv_service.go` 那层）
-- [ ] appliedIndex **与 KV 写入同一个 pebble write batch 原子提交**（two-WAL 协调：重启后知道从
-      Raft log 哪条续放；这是状态机落盘唯一真正深的点）
-- [ ] 快照：本地压缩只推 appliedIndex 水位 + 砍 Raft log 前缀；InstallSnapshot 的 wire 镜像按需产出
-- [ ] **收到 InstallSnapshot = 整库替换**（另建 pebble 灌满 → 原子换旧的），不能 merge（快照无 tombstone）
-- [ ] Raft log(WAL) 与 KV 状态机(pebble) **物理分目录**（决策 5）
-- [ ] go.mod 引入 pebble；评估依赖体积（可接受，行业标准）
-- **验收**：binary kill-all-重启，KV 数据 + raft log 都在，put/get/version 一致；数据集 > RAM 也能服务
+拆两小步（决定见对话）：**4a 不碰 raft 快照协议、零风险；4b 才侵入 raft 存 apply-id、放最后。**
 
-## Step 5 · binary 级端到端对账（最终验收）
+### Step 4a · KV 状态机换 pebble（raft 快照协议不动）
 
-- [ ] `scripts/run-local-cluster.sh` 起 3 节点 → 写入若干 KV → `kill -9` 全部 → 重启
-- [ ] 校验：leader 重新选出、log 无丢失、KV 全部命中、version 单调
-- [ ] 覆盖：leader 崩 / follower 崩 / 全崩三种
+> raft 快照的**两个角色**别只看一个：A 本地恢复、B InstallSnapshot 发给落后 follower（协议强制，必须能发）。
+> 4a 里 raft 一行不改——快照仍是 raft 存/发的一个 blob，只是 blob 内容从"map 序列化"变成"**复制整颗 LSM 树**"。
+
+- [ ] KV 状态机后端 map → pebble（live 存储，读写落盘、可 > RAM）。go.mod 引 pebble（可拉，goproxy.cn）。
+- [ ] `Snapshot()`：**不遍历序列化**——`pebble.Checkpoint()`（硬链 SSTable，一致）→ 打包 checkpoint 目录成 blob
+      → 交给现有 `raft.Snapshot(index, blob)`。`Restore(blob)`：解包成 pebble 目录 → 打开/替换。
+- [ ] raft 快照协议、InstallSnapshot 收发**照旧**（还是 blob），零 raft 风险。
+- [ ] KV log(fileWAL) 与 pebble 分目录。
+- **验收**：`scripts/test-crash-recovery.sh` 仍 PASS（数据跨 kill -9 存活）；开 maxraftstate>0 让 SaveSnapshot 真触发。
+- 代价（自知）：快照仍是 O(dataset) blob（没拿到 checkpoint 免物化的便宜）、恢复仍从 blob 重建 pebble。4b 才优化。
+
+### Step 4b · 解耦：apply-id + 引用式快照（侵入 raft，最后做）
+
+> 见 memory `filewal-embedded-snapshot-tradeoff`：本地恢复根本不用快照，pebble 自身 durable。
+
+- [ ] `apply-id`：每次 apply 把「KV 改动 + apply-id=该 index」放**同一 pebble write batch 原子提交**。重启读
+      apply-id K → 从 raft log `K+1` 续放（≤K 幂等跳过）。这是 two-WAL 协调的锚。
+- [ ] 角色 A 的 blob 拿掉：本地恢复 = 打开 live pebble + 补重放 log 尾，不再从 blob 重建。
+- [ ] 角色 B 改引用式：InstallSnapshot 现切 checkpoint 流式发；收方**整库替换**（快照无 tombstone，不能 merge）。
+- [ ] 两个协调点的顺序铁律：① 压缩：pebble durable≥N 才砍 raft log≤N；② 收 InstallSnapshot：先换 pebble(apply-id=K) 再置 raft snapshotIndex=K。
+- **验收**：`test-crash-recovery.sh`（4a 建立的回归网）仍 PASS + 数据集 > RAM 也能服务 + 落后 follower 经 InstallSnapshot 追齐。
+
+## Step 5 · binary 级端到端对账（真机 kill-all）✅ 完成（全崩场景）
+
+> 唯一让"组合后的 fileWAL"撞真 fsync + 真 kill -9 的测试。也作为 4a/4b 的回归网。
+
+- [x] `scripts/test-crash-recovery.sh`：起 3 节点 → 写 4 个 KV → `kill -9` 全部 → 重启同数据目录 → 校验全部存活。
+      **PASS**（fileWAL 真落盘 `meta`+`wal`；重启经 raft 重放 log 重建 KV）。
+- [ ]（可选加固）leader-only 崩 / follower-only 崩两种局部场景；version 单调专项校验。
+- 注：当前状态机是内存 map、`maxraftstate=-1`（快照关）→ 测的是 log 重放恢复。4a 开快照后重跑，覆盖 SaveSnapshot。
 
 ---
 

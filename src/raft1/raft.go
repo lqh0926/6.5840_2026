@@ -42,11 +42,10 @@ type AppendEntriesReply struct {
 }
 
 type Raft struct {
-	mu        sync.Mutex
-	peers     []transport.ClientEnd
-	persister persist.Persister
-	wal       WAL // 语义化持久化契约；Step-1 是 persisterWAL（包住 persister）
-	me        transport.NodeID
+	mu    sync.Mutex
+	peers []transport.ClientEnd
+	wal   WAL // 语义化持久化契约；Make 走 persisterWAL 适配器，binary 走 filewal.FileWAL
+	me    transport.NodeID
 
 	// Persistent state
 	term    int
@@ -108,7 +107,7 @@ func (rf *Raft) logAt(absIdx int) LogEntry {
 func (rf *Raft) PersistBytes() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.persister.RaftStateSize()
+	return rf.wal.Size()
 }
 
 // --- Snapshot ---
@@ -587,8 +586,16 @@ func (rf *Raft) sendApplyMsg() {
 
 // --- Make ---
 
+// Make 用内存/文件 persister 引导 Raft —— L1 测试与旧路径走这条，内部包一层
+// persisterWAL 适配器（行为逐字节等于改造前）。
 func Make(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID,
 	persister persist.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+	return MakeWithWAL(peers, me, nodeIDs, newPersisterWAL(persister), applyCh)
+}
+
+// MakeWithWAL 直接注入一个 WAL 实现（binary 用 filewal.FileWAL 走这条）。
+func MakeWithWAL(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID,
+	w WAL, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	matchIndex := make(map[transport.NodeID]int, len(peers))
 	nextIndex := make(map[transport.NodeID]int, len(peers))
 	nodeIndex := make(map[transport.NodeID]int, len(peers))
@@ -600,7 +607,6 @@ func Make(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.
 
 	rf := &Raft{
 		peers:      peers,
-		persister:  persister,
 		me:         me,
 		term:       0,
 		customerId: Follower,
@@ -614,7 +620,7 @@ func Make(peers []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.
 		nodeIndex:  nodeIndex,
 	}
 
-	rf.wal = newPersisterWAL(persister)
+	rf.wal = w
 	if st, ok := rf.wal.Load(); ok {
 		rf.term = st.Term
 		rf.logs = st.Logs

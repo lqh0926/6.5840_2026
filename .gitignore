@@ -3,3 +3,5 @@ pkg/
 
 # 本地集群脚手架产物（scripts/run-local-cluster.sh）
 .cluster/
+# 崩溃恢复测试产物（scripts/test-crash-recovery.sh）
+.crashtest/

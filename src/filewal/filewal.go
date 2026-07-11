@@ -52,6 +52,10 @@ type FileWAL struct {
 
 	rl      *wal.RecordLog // wal 文件的末尾追加句柄
 	records [][]byte       // Open 时读回并 healing 后的 record（供 Load 一次性解析）
+
+	// logBytes 近似"上次压缩以来的日志字节"（**不含**内嵌快照），供 Size()/maxraftstate。
+	// 用 payload 长度累加即可（阈值判断，不求精确）。含快照会让快照后 Size 虚高、触发抖动。
+	logBytes int
 }
 
 var _ raft.WAL = (*FileWAL)(nil)
@@ -71,6 +75,11 @@ func Open(fs wal.FS, dir string) (*FileWAL, error) {
 	}
 	fw.rl = rl
 	fw.records = records
+	for _, p := range records { // 初始化 logBytes：非 header record 的 payload 字节
+		if len(p) > 0 && p[0] != recHeader {
+			fw.logBytes += len(p)
+		}
+	}
 	return fw, nil
 }
 
@@ -124,14 +133,21 @@ func (fw *FileWAL) SaveMeta(term int, vote transport.NodeID) {
 // AppendLog 追加日志条目（每条一 record，fsync 后返回）。
 func (fw *FileWAL) AppendLog(entries []raft.LogEntry) {
 	for i := range entries {
-		must(fw.rl.Append(encodeEntry(entries[i])))
+		p := encodeEntry(entries[i])
+		must(fw.rl.Append(p))
+		fw.logBytes += len(p)
 	}
 }
 
 // TruncateSuffix 追加一条 truncate marker（纯 append，不原地改历史）。
 func (fw *FileWAL) TruncateSuffix(fromIndex int) {
-	must(fw.rl.Append(encodeTruncate(fromIndex)))
+	p := encodeTruncate(fromIndex)
+	must(fw.rl.Append(p))
+	fw.logBytes += len(p)
 }
+
+// Size 返回上次压缩以来的日志字节（近似，不含快照），供 maxraftstate 触发压缩。
+func (fw *FileWAL) Size() int { return fw.logBytes }
 
 // SaveSnapshot 整体重写 wal：新 header（含内嵌 snapshot）+ suffix 条目，一次原子写。
 // 快照与"丢弃前缀"在同一次 AtomicWrite 提交，无中间窗口。
@@ -142,16 +158,22 @@ func (fw *FileWAL) SaveSnapshot(snapshotIndex, sentinelTerm int, snapshot []byte
 		SentinelTerm:  sentinelTerm,
 		Snapshot:      snapshot,
 	}))
+	suffixBytes := 0
 	for i := range suffix {
-		content = wal.AppendRecord(content, encodeEntry(suffix[i]))
+		p := encodeEntry(suffix[i])
+		content = wal.AppendRecord(content, p)
+		suffixBytes += len(p)
 	}
 	must(wal.AtomicWrite(fw.fs, fw.dir, fw.walPath, content))
+	fw.logBytes = suffixBytes // 前缀已压缩掉，只剩 suffix 计入日志字节
 
-	// 旧追加句柄指向被 rename 换掉的旧 inode，失效 → 重开到新 wal 的末尾。
+	// 旧追加句柄指向被 rename 换掉的旧 inode，失效 → 复位到新 wal 的末尾。
+	// 刚原子写完的 wal 是干净的，直接 OpenAppend 拿末尾句柄即可，**不必**再 ReadFile+replay
+	// 整条 wal（含内嵌快照，那会是 O(snapshot) 的多余读——内嵌设计的已知代价）。
 	fw.rl.Close()
-	rl, _, err := wal.OpenRecordLog(fw.fs, fw.walPath)
+	f, err := fw.fs.OpenAppend(fw.walPath)
 	must(err)
-	fw.rl = rl
+	fw.rl = wal.NewRecordLog(f)
 }
 
 // Close 关闭底层追加句柄。

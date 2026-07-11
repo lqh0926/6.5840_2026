@@ -131,7 +131,9 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister persist.Persister, m
 // NodeID 装配（走 raft.Make，而非 labrpc 适配器）。仅供真 binary 使用，
 // 不经 tester，故不看 UseRaftStateMachine。labrpc 老路（MakeRSM）保持不变，
 // L1 测试不受影响。
-func MakeRSMGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID, persister persist.Persister, maxraftstate int, sm StateMachine) *RSM {
+// MakeRSMGrpc 走真 binary 路径：直接注入一个 raft.WAL（filewal.FileWAL），经
+// raft.MakeWithWAL 引导，不再包 persist.Persister。
+func MakeRSMGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID, w raft.WAL, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
 		me:           0, // 仅用于日志；gRPC 路径用 NodeID 标识，无 int 下标
 		maxraftstate: maxraftstate,
@@ -140,7 +142,7 @@ func MakeRSMGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []tran
 		chMap:        make(map[int]chan any),
 		hashNumMap:   make(map[int]int64),
 	}
-	rsm.rf = raft.Make(ends, me, nodeIDs, persister, rsm.applyCh)
+	rsm.rf = raft.MakeWithWAL(ends, me, nodeIDs, w, rsm.applyCh)
 	go rsm.readApplyCh()
 	return rsm
 }
