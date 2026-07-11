@@ -86,6 +86,30 @@
 
 **改造纪律**：先扩接口 → 逐个 persist 调用点替换 → **每步跑 raft1/kvraft1 全回归**，别一把梭（关键路径）。
 
+### 面试深挖点（🟣 6.5840 不涉及，Phase 2 净新增的知识）
+
+> 这几条是复盘时补上的知识缺口（当时没 review `persist/file.go` 的 `atomicWrite`），面试 durability 连环追问区。
+
+**① 崩溃安全 = 两把原语，不是"让单次 write+fsync 原子"**（崩溃能砸在 write 中间，挡不住）：
+- **整文件重写（meta/snapshot）→ 原子性来自 `rename`**：写 tmp→fsync(tmp)→rename→fsync(dir)。rename 是
+  POSIX 保证的目录项一次性换 inode，读者只见完整旧或完整新。两个 fsync 分卡 rename 两边：fsync(tmp) 在前
+  （换过去的 inode 要有真数据），fsync(dir) 在后（持久化 rename 这个目录项改动，rename 得先发生）——**"rename
+  之后才 fsync"不是 bug 是必须**。
+- **尾部追加（log）→ 正确性来自 replay 校验**：record `[len][crc32][payload]`；replay 撞到 len 越界/crc 坏
+  即判 torn tail、在该 offset 截断。append-only 下崩溃只砸没落盘的尾巴，已 fsync 的老 record 不被后来的崩溃碰坏。
+
+**② crash 测试测的是"save 契约"，不是 Raft 算法**：Raft persist-before-reply → 丢"没 ack 的写"算法自容忍（低价值）。
+真价值是三契约：replay 抗 torn（否则带垃圾状态起来去 ack → 安全性破）、meta 原子（撕裂 votedFor → 同 term 投两次）、
+**SaveSnapshot 顺序**（压缩丢的是早已 ack 的前缀，persist-before-reply 够不到，只有 fsync 顺序挡着）。
+
+**③ 压缩用整体重写、不做分段**：重写的是"活尾巴"（index>snapshotIndex，恒短，因 snapshotIndex≈appliedIndex），
+不是整条 log → 压缩再频繁每次也 O(小)。分段的好处（免重写/O(1) unlink）只在活 log 很大时兑现，本项目不触发，
+却要背段 roll/区间索引/GC/跨段 Load 四块复杂度 → 不划算。分段留白板题（etcd 为何分段 = 活 log 大到重写不可接受）。
+
+**④ `Load()` 崩溃恢复重建**（6.5840 只"读回整块 blob decode"，无此逻辑）：读 meta+wal header+replay+snapshot 拼装，
+**log 起点锚定在 snapshotIndex（从 snapshot 反推，不信 wal 物理布局）** → raft 永不见"snap@10 但 log@5"的错配。
+snap/log 一致性是 Load 按构造保证的。
+
 ---
 
 ## Phase 3 · Docker + k8s 部署

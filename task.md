@@ -130,24 +130,95 @@ raft 依赖新接口，给**两份实现**：
 - [x] `go test -race ./kvraft1/` 全绿（4A/4B，重度走 SaveSnapshot）—— `ok 271.4s`
 - [ ] （可选加固）`make RUN=... shardkv` 抽样，确认 rsm→raft 持久化路径无碍
 
-## Step 2 · 崩溃恢复单测（命门，自己想清楚）
+## Step 2 · 崩溃恢复单测（命门，自己想清楚）✅ 完成
 
 > 在换真 WAL **之前**先把对账测试写好，作为 fileWAL 的验收标尺。
 
-- [ ] 设计 kill-9-重启对账用例：随机 append/truncate/compact/saveMeta 序列 → 重启 → `Load` 结果必须等于崩溃点前"已 fsync 承诺"的状态
-- [ ] 明确不变式：已 fsync 的 AppendLog 必须在；未 fsync 的可有可无；Compact 后前缀必须不可见且 snapshot 在
-- [ ] 用文件级 fault 注入模拟"写一半崩"（截断 tmp / 中途 kill）
+**实现记录**（新包 `src/wal/`，12 个测试全绿含 `-race`）
+- 底层原语（Step 3 会复用）：`record.go` 崩溃安全 append-only record log（`[len][crc32][payload]`，
+  replay 撞 torn 即截断）；`atomic.go` `AtomicWrite`（tmp→fsync→rename→fsync dir）；`fs.go` 可注入
+  `FS`/`File` seam + `OSFS`。
+- 故障注入：`fakefs_test.go` 的 `memFS`（立即持久化悲观模型），能造：写一半崩 / rename 前崩 / rename 后崩。
+- 三契约 + 三负向变体：
+  - #1 replay 抗 torn：`record_test.go`（torn header/payload、crc 位翻转）+ 负向 `replayRecordsNoCRC`（漏过位翻转）。
+  - #2 meta 原子：`atomic_test.go`（三崩溃点 path 恒非旧即新）+ 负向 `atomicWriteInPlace`（原地覆盖会撕裂）。
+  - #3 SaveSnapshot 顺序：`ordering_test.go`（snapshot 先→空隙可恢复）+ 负向"反序"（先删前缀→丢已提交数据）。
+- 负向变体全部断言"能被对账检查抓到"，证明测试是承重的、非摆设。
+
+### 测什么：不是 Raft 算法，是"save 有没有兑现契约"
+
+Raft 是 **persist-before-reply**（授票/回 ack 前先落盘），所以"丢掉没 fsync、没 ack 的写"**算法本身
+就容忍**（peer 重发），这类 fault **价值低、不测**。crash 测试测的是 **WAL 有没有兑现算法赖以成立的那个
+"save"契约**——三条契约，前两条与"没回就没事"正交，第三条恰恰是 persist-before-reply 保护不到的：
+
+1. **replay 抗 torn tail**（不是"丢没丢"，是"读回来是不是垃圾"）：崩在 record 写一半。naive 实现会
+   panic（起不来=可用性）或把垃圾当合法 record 读进来（带错 term/log 起来 → 再去投票/ack → **安全性破**）。
+   契约：replay 必须在**最后一条完整 record** 处干净截断。
+2. **meta 覆盖原子**（旧 or 新，永不撕裂）：term/votedFor 覆盖崩在中间，非原子写 → 读回撕裂的 votedFor
+   → 同 term 投两次 → 脑裂。契约：靠 rename，读到的永远是完整旧值或完整新值。
+3. **SaveSnapshot 顺序**（persist-before-reply 够不到的地方）⭐：压缩丢弃的是**早就 committed / applied /
+   ack 过**的前缀，reply 是过去发生的。顺序反了（compact marker 先 durable、snapshot 没落）+ 崩在中间
+   → 丢已提交数据、本地无法重建。契约：snapshot 必须先 durable，才允许物理动 log 前缀。
+
+### 怎么测：注入 seam + 负向变体
+
+- [x] fileWAL 写盘走可注入 seam（`FS`/`File`），fake 能：① 写一半崩 ② rename 前/后崩。生产用 `OSFS`。
+- [x] **不变式断言**：torn 尾巴干净截断不 panic；meta 非旧即新不撕裂；SaveSnapshot 崩在 snapshot-已落/
+      前缀-未删时 → 用完整 log 恢复、零丢失。
+- [x] **负向变体（让测试立得住）**：(a) `replayRecordsNoCRC` 不校验 crc、(b) `atomicWriteInPlace` 原地覆盖、
+      (c) 反序压缩 —— 三个都断言"能被抓到"（必须 fail），非摆设。
+- [→ Step 3] **端到端对账用例**（随机 op 序列 → 崩 → `Load()` 对账）需要真 fileWAL 的 `Load()`，随 Step 3
+      的 fileWAL 一起落地：把这三契约的原语组合成 `raft1.WAL` 后，跑组合层的随机序列对账。
 
 ## Step 3 · 实现 fileWAL（真 append-only + fsync + 重放）
 
-- [ ] WAL record 格式：`[len][crc][type][payload]`，type ∈ {append, truncate, meta, compact-marker}
-- [ ] `AppendLog`：seek 到尾追加 record → fsync；`Load` 顺序重放 records 重建 log
-- [ ] `TruncateSuffix`：写一条 truncate record（重放时逻辑截尾），不物理改历史
-- [ ] `SaveMeta`：独立 `meta` 小文件原子覆盖（tmp→fsync→rename→fsync dir），不进 WAL
-- [ ] `Compact`：snapshot 独立文件原子写+fsync → **后**写 compact record 丢 log 前缀（顺序！）
-- [ ] 崩溃安全：重放遇 crc 失败 / 半截 record → 在最后一条完整 record 处截断（尾部撕裂容忍）
-- [ ] 段轮转/压缩（避免 WAL 无限增长）—— 最简即可；etcd 级段管理当白板延伸题，别过度
-- **验收**：Step 2 的对账单测全绿（含 `-race`）
+### 核心机关：两把原语（崩溃安全 ≠ 让单次 write+fsync 原子）
+
+崩溃能砸在 write 中间，挡不住。所以**按写模式选原语**，不在那一层求原子：
+
+- **整文件重写（meta / snapshot）→ 原子性来自 `rename`**：写 tmp → fsync(tmp) → rename → fsync(dir)。
+  rename 是 POSIX 保证的目录项一次性换 inode，读者只见完整旧或完整新。**直接复用 `persist/file.go`
+  的 `atomicWrite`**（注：它吞了 dir-fsync 的 error，真 WAL 想严谨可 propagate）。
+  - 两个 fsync 顺序不能变：fsync(tmp) 在 rename **前**（换过去的 inode 要有真数据）；fsync(dir) 在
+    rename **后**（持久化的是 rename 这个目录项改动，rename 得先发生）。
+- **尾部追加（log）→ 正确性来自 replay 校验**：record = `[len:u32][crc32:u32][payload]`。append-only
+  下崩溃只砸没落盘的尾巴，已 fsync 的老 record 不会被后来的崩溃碰坏。
+
+### 决策：压缩用**整体重写**，不做分段（🟣 要能复述）
+
+- **重写的是"活尾巴"（index > snapshotIndex），不是整条 log**。`snapshotIndex = appliedIndex`，稳态下
+  applied ≈ 最新，活尾巴恒短（受在途复制窗口界定，非历史总量）。→ 压缩**再频繁**，每次重写也 O(小)：
+  压缩本身在删历史，你只拷没被快照盖住的那点尾。"频繁压缩 = 频繁全量拷"是错觉。
+- **分段的唯一好处（免重写、O(1) unlink 回收）只在"活 log 很大"时兑现**，本项目活尾恒小 → 不触发；
+  而分段要背 4 块复杂度（段 roll / 段→区间索引 / 段 GC / Load 跨段+骑跨段前缀跳过）。→ **不划算**。
+- 结论：**重写 over 分段**。热路径 append 两者都 O(1)（这才是 WAL 对"全量 blob 重写"的核心收益，重写
+  方案 100% 拿到）；只在冷路径压缩用一次小重写，换掉整个分段体系。分段留作白板题（"etcd 为什么分段"
+  = 活 log 大到重写不可接受时，用 O(1) unlink 换 O(活尾)重写）。
+
+### 文件布局（三份，按变更频率/写模式分）
+
+- `meta`：term / votedFor —— 高频覆盖，原子 rename（原语1）。
+- `wal`：header `base=(snapshotIndex N, sentinelTerm T)` + 一串 entry record —— 正常 append；压缩时重写。
+- `snapshot`：KV 快照字节 —— 偶发大写，原子 rename（原语1）。
+
+### 各操作实现
+
+- [ ] `AppendLog`：append record 到 wal 尾 → **fsync 后才返回**（回 ack 前须 durable，决策 4）。
+- [ ] `TruncateSuffix`：append 一条 `truncate-to-K` marker（纯 append，不原地改历史）；replay 撞到它丢
+      ≥K。site5（冲突）= truncate marker 后紧跟新 entry 的 append，replay 顺序处理 → 旧尾先逻辑丢、再灌新。
+- [ ] `SaveMeta`：独立 `meta` 文件原子覆盖，不进 wal。
+- [ ] `SaveSnapshot`（顺序铁律）：① `atomicWrite` 落 snapshot 文件 → ② 重写 wal 为「新 header(N,T) +
+      仅 index>N 的 entry」原子 rename 盖旧 wal。**snapshot 必须先 durable 再动 wal 前缀**；反了 = 丢已提交
+      数据。崩在①后②前：snapshot 在、旧 wal(全前缀)也在 → Load 用 snapshot@N 跳过 ≤N → 一致、零丢。
+- [ ] `Load` 重建算法（6.5840 不涉及的净新增，一致性保证所在）：
+      1. 读 meta → term, votedFor
+      2. 读 wal header → `base=(N,T)`；log 置 `[sentinel@N(T)]`
+      3. 顺序 replay entry record：`≤N 跳过`、`>N 才 append`；撞 truncate marker 丢 ≥K；撞 len 越界/crc
+         坏 → torn tail，停并截断
+      4. 读 snapshot 文件 → 快照字节
+      - **不变式：log 起点锚定在 snapshotIndex（从 snapshot 反推，不信 wal 物理布局）** → raft 永远拿不到
+        "snap@10 但 log@5"的错配。
+- **验收**：Step 2 的对账单测（含三契约 + 三负向变体）全绿（含 `-race`）
 
 ## Step 4 · KV 状态机：内存 map → 磁盘 LSM（pebble）
 
@@ -176,8 +247,8 @@ raft 依赖新接口，给**两份实现**：
 | Step | 硬门槛 |
 |------|--------|
 | 1 | raft1(3A-3D)+kvraft1(4A/4B) 全绿含 `-race`，行为逐字节等于改造前 |
-| 2 | 崩溃对账单测覆盖 append/truncate/compact/meta + 撕裂尾部 |
-| 3 | fileWAL 通过 Step 2 全部单测（含 `-race`） |
+| 2 | 对账单测覆盖三契约（replay 抗 torn / meta 原子 / SaveSnapshot 顺序）+ 三负向变体能被抓到 |
+| 3 | fileWAL（重写压缩 + Load 锚定 snapshotIndex）通过 Step 2 全部单测（含 `-race`） |
 | 4 | KV 状态机走 pebble（磁盘模型）、与 log 分目录；appliedIndex 与写入原子提交；重启无需重建即服务 |
 | 5 | 三种崩溃场景端到端对账通过 |
 
