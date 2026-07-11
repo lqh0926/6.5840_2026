@@ -130,10 +130,11 @@ func TestNegativeVariant_NoCRC_MissesBitFlip(t *testing.T) {
 // TestRecordLogHealsTornTail：文件级——写入若干 record、关闭，往文件尾追加垃圾（模拟
 // 崩溃留下的撕裂尾巴），重开时应恢复出干净的 record 并把垃圾物理截断，之后还能继续 append。
 func TestRecordLogHealsTornTail(t *testing.T) {
+	fs := OSFS()
 	path := filepath.Join(t.TempDir(), "test.wal")
 	a, b := []byte("alpha"), []byte("bravo")
 
-	l, recs, err := OpenRecordLog(path)
+	l, recs, err := OpenRecordLog(fs, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +161,7 @@ func TestRecordLogHealsTornTail(t *testing.T) {
 	f.Close()
 
 	// 重开：应 healing 掉撕裂尾巴。
-	l2, recs2, err := OpenRecordLog(path)
+	l2, recs2, err := OpenRecordLog(fs, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +176,7 @@ func TestRecordLogHealsTornTail(t *testing.T) {
 	}
 	l2.Close()
 
-	_, recs3, err := OpenRecordLog(path)
+	_, recs3, err := OpenRecordLog(fs, path)
 	if err != nil {
 		t.Fatal(err)
 	}

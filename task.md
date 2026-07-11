@@ -195,30 +195,37 @@ Raft 是 **persist-before-reply**（授票/回 ack 前先落盘），所以"丢�
   方案 100% 拿到）；只在冷路径压缩用一次小重写，换掉整个分段体系。分段留作白板题（"etcd 为什么分段"
   = 活 log 大到重写不可接受时，用 O(1) unlink 换 O(活尾)重写）。
 
-### 文件布局（三份，按变更频率/写模式分）
+### 文件布局（实现：两份文件，snapshot 内嵌 wal —— 见下方取舍）
 
 - `meta`：term / votedFor —— 高频覆盖，原子 rename（原语1）。
-- `wal`：header `base=(snapshotIndex N, sentinelTerm T)` + 一串 entry record —— 正常 append；压缩时重写。
-- `snapshot`：KV 快照字节 —— 偶发大写，原子 rename（原语1）。
+- `wal`：可选 `header`(内嵌 base=(N,T) + **snapshot 字节**) + 一串 entry / truncate record。正常 append；压缩时整体重写。
 
-### 各操作实现
+> **取舍：snapshot 内嵌 wal header，不做独立快照文件**（偏离最初"独立文件+顺序铁律"的设想，更简）。
+> `SaveSnapshot` = 一次 `AtomicWrite` 重写整个 wal（header含snapshot + suffix），于是"落快照"与"丢弃前缀"
+> 在**同一次原子写**里提交 → **顺序 hazard 直接消失**，独立快照文件的 orphan/GC 也不存在。代价：压缩重写
+> wal 会连快照一起拷（O(snapshot)），但压缩本就要写新快照、且本项目数据小，可接受。契约 #3 的"顺序"
+> 在此设计下退化为"单次原子写"（Step 2 的顺序测试仍留作原理演示：证明"分两次写时"为何必须有序）。
 
-- [ ] `AppendLog`：append record 到 wal 尾 → **fsync 后才返回**（回 ack 前须 durable，决策 4）。
-- [ ] `TruncateSuffix`：append 一条 `truncate-to-K` marker（纯 append，不原地改历史）；replay 撞到它丢
-      ≥K。site5（冲突）= truncate marker 后紧跟新 entry 的 append，replay 顺序处理 → 旧尾先逻辑丢、再灌新。
-- [ ] `SaveMeta`：独立 `meta` 文件原子覆盖，不进 wal。
-- [ ] `SaveSnapshot`（顺序铁律）：① `atomicWrite` 落 snapshot 文件 → ② 重写 wal 为「新 header(N,T) +
-      仅 index>N 的 entry」原子 rename 盖旧 wal。**snapshot 必须先 durable 再动 wal 前缀**；反了 = 丢已提交
-      数据。崩在①后②前：snapshot 在、旧 wal(全前缀)也在 → Load 用 snapshot@N 跳过 ≤N → 一致、零丢。
-- [ ] `Load` 重建算法（6.5840 不涉及的净新增，一致性保证所在）：
-      1. 读 meta → term, votedFor
-      2. 读 wal header → `base=(N,T)`；log 置 `[sentinel@N(T)]`
-      3. 顺序 replay entry record：`≤N 跳过`、`>N 才 append`；撞 truncate marker 丢 ≥K；撞 len 越界/crc
-         坏 → torn tail，停并截断
-      4. 读 snapshot 文件 → 快照字节
-      - **不变式：log 起点锚定在 snapshotIndex（从 snapshot 反推，不信 wal 物理布局）** → raft 永远拿不到
-        "snap@10 但 log@5"的错配。
-- **验收**：Step 2 的对账单测（含三契约 + 三负向变体）全绿（含 `-race`）
+### 各操作实现 ✅ 完成（新包 `src/filewal/`，组合 `src/wal/` 原语）
+
+- [x] `AppendLog`：`RecordLog.Append` 到 wal 尾 → **fsync 后才返回**（回 ack 前须 durable，决策 4）。
+- [x] `TruncateSuffix`：append `truncate-to-K` marker（纯 append，不原地改历史）；replay 撞到丢 ≥K。
+      site5（冲突）= truncate marker 后紧跟新 entry 的 append，replay 顺序处理 → 旧尾先逻辑丢、再灌新。
+- [x] `SaveMeta`：`meta` 文件原子覆盖（`AtomicWrite`），不进 wal。
+- [x] `SaveSnapshot`：`AtomicWrite` 整体重写 wal = `header(N,T,snapshot)` + suffix 条目，**一次原子提交**。
+- [x] `Load` 重建算法（6.5840 不涉及的净新增，一致性保证所在）：读 meta → 解析 wal record：首条若 header
+      取 base=(N,T)+内嵌 snapshot、log 置 `[sentinel@N(T)]`；其余 entry 追加 / truncate 丢 ≥K；撞坏即截断。
+      **不变式：log 起点锚定 snapshotIndex（从 header 反推，不信物理布局）** → raft 永不见"snap@10 但 log@5"。
+- [x] **组合对账测试**（Step 2 延后的那条）：`filewal_test.go` round-trip 逐字段对账 + 崩溃注入
+      （SaveMeta 写 tmp 崩 / append 写一半崩 / 压缩 rename 前后崩）→ 重启 Load 均自洽零丢失。
+- **验收**：`go test -race ./filewal/ ./wal/` 全绿（filewal 5 组、wal 12 个）；raft1/kvraft1 build 不受影响。
+
+### 还差（Step 3 收尾，单独一轮）：binary 注入
+
+- [ ] `raft.MakeWithWAL(peers, me, nodeIDs, wal, applyCh)`；`Make` 委托 `newPersisterWAL`（L1 路径不动）。
+- [ ] WAL 顺着 `StartKVServerGrpc → MakeRSMGrpc` 传下去（**只改 grpc 变体**）；`cmd/raftkvd` 构造 `filewal.Open(OSFS, dataDir)` 注入。
+- [ ] KV 层快照读：现走 `persister.ReadSnapshot()`（server.go:174），换 fileWAL 后让它经 WAL 暴露/转交。
+- [ ] 回归：raft1 / kvraft1 仍全绿（Make 老路径没动）。
 
 ## Step 4 · KV 状态机：内存 map → 磁盘 LSM（pebble）
 

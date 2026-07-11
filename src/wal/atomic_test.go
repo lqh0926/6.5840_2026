@@ -37,23 +37,23 @@ func isTorn(got []byte) bool {
 func TestAtomicWrite_NeverTorn(t *testing.T) {
 	cases := []struct {
 		name  string
-		setup func(*memFS)
+		setup func(*MemFS)
 		want  []byte // 期望崩溃后 path 的内容
 	}{
-		{"crash writing tmp", func(m *memFS) { m.faultWriteLimit = 3 }, oldVal},
-		{"crash before rename", func(m *memFS) { m.faultRename = "before" }, oldVal},
-		{"crash after rename", func(m *memFS) { m.faultRename = "after" }, newVal},
+		{"crash writing tmp", func(m *MemFS) { m.FaultWriteLimit = 3 }, oldVal},
+		{"crash before rename", func(m *MemFS) { m.FaultRename = "before" }, oldVal},
+		{"crash after rename", func(m *MemFS) { m.FaultRename = "after" }, newVal},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fs := newMemFS()
+			fs := NewMemFS()
 			if err := AtomicWrite(fs, ".", "meta", oldVal); err != nil {
 				t.Fatalf("seed write: %v", err)
 			}
 			tc.setup(fs)
 			_ = AtomicWrite(fs, ".", "meta", newVal) // 预期崩溃、返回 error
 
-			got, ok := fs.content("meta")
+			got, ok := fs.Content("meta")
 			if !ok {
 				t.Fatal("meta disappeared")
 			}
@@ -71,25 +71,25 @@ func TestAtomicWrite_NeverTorn(t *testing.T) {
 // 而原地覆盖变体会撕裂。证明 rename 契约是承重的、且测试能区分正确与错误实现。
 func TestNegativeVariant_InPlace_CanTear(t *testing.T) {
 	// 正确实现：写 tmp 崩 → path 仍是完整旧值。
-	fsGood := newMemFS()
+	fsGood := NewMemFS()
 	if err := AtomicWrite(fsGood, ".", "meta", oldVal); err != nil {
 		t.Fatal(err)
 	}
-	fsGood.faultWriteLimit = 3
+	fsGood.FaultWriteLimit = 3
 	_ = AtomicWrite(fsGood, ".", "meta", newVal)
-	good, _ := fsGood.content("meta")
+	good, _ := fsGood.Content("meta")
 	if isTorn(good) {
 		t.Fatalf("AtomicWrite should never tear, got %q", good)
 	}
 
 	// 负向变体：原地覆盖崩在写一半 → 撕裂。
-	fsBad := newMemFS()
+	fsBad := NewMemFS()
 	if err := AtomicWrite(fsBad, ".", "meta", oldVal); err != nil {
 		t.Fatal(err)
 	}
-	fsBad.faultWriteLimit = 3
+	fsBad.FaultWriteLimit = 3
 	_ = atomicWriteInPlace(fsBad, "meta", newVal)
-	bad, _ := fsBad.content("meta")
+	bad, _ := fsBad.Content("meta")
 
 	if !isTorn(bad) {
 		t.Fatalf("in-place variant should tear on mid-write crash, got %q (test not exercising the bug)", bad)

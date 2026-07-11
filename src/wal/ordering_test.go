@@ -23,17 +23,17 @@ var (
 func oldWal() []byte { return append(append([]byte{}, prefixMark...), tailMark...) }
 
 // recoverable：崩溃后还能不能重建出 ≤N 的已提交状态。
-func recoverable(fs *memFS) bool {
-	snap, _ := fs.content("snapshot")
+func recoverable(fs *MemFS) bool {
+	snap, _ := fs.Content("snapshot")
 	snapPresent := bytes.Equal(snap, snapMark)
-	wal, _ := fs.content("wal")
+	wal, _ := fs.Content("wal")
 	walHasPrefix := bytes.Contains(wal, prefixMark)
 	return snapPresent || walHasPrefix
 }
 
-func seedPreCompaction(t *testing.T) *memFS {
+func seedPreCompaction(t *testing.T) *MemFS {
 	t.Helper()
-	fs := newMemFS()
+	fs := NewMemFS()
 	if err := AtomicWrite(fs, ".", "wal", oldWal()); err != nil {
 		t.Fatal(err)
 	}
@@ -62,10 +62,10 @@ func TestSaveSnapshotOrder_CrashDuringWalRewrite(t *testing.T) {
 	if err := AtomicWrite(fs, ".", "snapshot", snapMark); err != nil {
 		t.Fatal(err)
 	}
-	fs.faultRename = "after" // 重写 wal 时崩在 rename 后：wal=新（前缀已丢）
+	fs.FaultRename = "after" // 重写 wal 时崩在 rename 后：wal=新（前缀已丢）
 	_ = AtomicWrite(fs, ".", "wal", tailMark)
 
-	if wal, _ := fs.content("wal"); bytes.Contains(wal, prefixMark) {
+	if wal, _ := fs.Content("wal"); bytes.Contains(wal, prefixMark) {
 		t.Fatal("setup: expected wal prefix dropped by the crash-after-rename")
 	}
 	if !recoverable(fs) {
@@ -85,7 +85,7 @@ func TestSaveSnapshotFullCompaction(t *testing.T) {
 	if !recoverable(fs) {
 		t.Fatal("completed compaction must be recoverable")
 	}
-	if wal, _ := fs.content("wal"); bytes.Contains(wal, prefixMark) {
+	if wal, _ := fs.Content("wal"); bytes.Contains(wal, prefixMark) {
 		t.Fatal("completed compaction should have reclaimed the prefix")
 	}
 }

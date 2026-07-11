@@ -9,12 +9,14 @@ package wal
 import (
 	"encoding/binary"
 	"hash/crc32"
-	"io"
-	"os"
 )
 
 // recordHeaderSize 是每条 record 的定长头：[len:u32][crc32:u32]（均大端）。
 const recordHeaderSize = 8
+
+// AppendRecord 把 payload 编码成 [len][crc32(payload)][payload] 追加到 dst。
+// 导出供上层（filewal）在压缩重写整个 wal 时批量拼装 record 内容。
+func AppendRecord(dst, payload []byte) []byte { return appendRecord(dst, payload) }
 
 // appendRecord 把 payload 编码成 [len][crc32(payload)][payload] 追加到 dst。
 func appendRecord(dst, payload []byte) []byte {
@@ -53,39 +55,34 @@ func replayRecords(data []byte) (records [][]byte, validLen int) {
 	return records, validLen
 }
 
-// RecordLog 是文件背书的崩溃安全 append-only record log。
+// RecordLog 是文件背书的崩溃安全 append-only record log（走 FS seam，可注入）。
 //   - Append：追加一条 record 后 **fsync 才返回**（回 ack 前须 durable）。
 //   - Open：读回文件、replay，若尾部撕裂则物理 Truncate 掉，使后续 append 从干净处开始。
+//
+// 全量读只发生在 Open（一次，启动恢复）；Append 走末尾句柄，是 O(record) 追加，从不回读。
 type RecordLog struct {
-	f    *os.File
-	size int64 // 当前有效字节长度（= 下一条 append 的写入位置）
+	f File // 定位在末尾的追加句柄
 }
 
-// OpenRecordLog 打开（或创建）path 处的日志，healing 掉任何撕裂尾巴，返回恢复出的
+// OpenRecordLog 打开（或创建）fs 中 name 处的日志，healing 掉任何撕裂尾巴，返回恢复出的
 // record 列表和一个定位在有效末尾、可继续 append 的 RecordLog。
-func OpenRecordLog(path string) (*RecordLog, [][]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+func OpenRecordLog(fs FS, name string) (*RecordLog, [][]byte, error) {
+	data, err := fs.ReadFile(name)
 	if err != nil {
-		return nil, nil, err
-	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		f.Close()
 		return nil, nil, err
 	}
 	records, validLen := replayRecords(data)
 	if validLen != len(data) {
 		// 撕裂尾巴：物理截断到最后一条完整 record。
-		if err := f.Truncate(int64(validLen)); err != nil {
-			f.Close()
+		if err := fs.Truncate(name, int64(validLen)); err != nil {
 			return nil, nil, err
 		}
 	}
-	if _, err := f.Seek(int64(validLen), io.SeekStart); err != nil {
-		f.Close()
+	f, err := fs.OpenAppend(name) // 定位到（截断后的）末尾
+	if err != nil {
 		return nil, nil, err
 	}
-	return &RecordLog{f: f, size: int64(validLen)}, records, nil
+	return &RecordLog{f: f}, records, nil
 }
 
 // Append 编码并写入 payload，fsync 成功后才返回（返回即 durable）。
@@ -94,11 +91,7 @@ func (l *RecordLog) Append(payload []byte) error {
 	if _, err := l.f.Write(rec); err != nil {
 		return err
 	}
-	if err := l.f.Sync(); err != nil {
-		return err
-	}
-	l.size += int64(len(rec))
-	return nil
+	return l.f.Sync()
 }
 
 // Close 关闭底层文件。
