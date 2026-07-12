@@ -58,7 +58,7 @@ func (rs *rsmSrv) GetCounter() int {
 	return rs.counter
 }
 
-func (rs *rsmSrv) DoOp(req any) any {
+func (rs *rsmSrv) DoOp(_ int, req any) any {
 	//log.Printf("%d: DoOp: %T(%v)", rs.me, req, req)
 	switch req.(type) {
 	case Inc:

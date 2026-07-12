@@ -1,8 +1,6 @@
 package kvraft
 
 import (
-	"bytes"
-
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
@@ -21,89 +19,57 @@ type kvEntry struct {
 type KVServer struct {
 	me    int
 	rsm   *rsm.RSM
-	kvMap map[string]kvEntry
-	// Your definitions here.
+	store KVStore // 可插拔后端：mapStore（L1）/ pebblestore.Store（binary）
 }
 
 type Snapshot struct {
 	KvMap map[string]kvEntry
 }
 
-// To type-cast req to the right type, take a look at Go's type switches or type
-// assertions below:
-//
-// https://go.dev/tour/methods/16
-// https://go.dev/tour/methods/15
-func (kv *KVServer) DoOp(req any) any {
-	// Your code here
-	if getArgs, ok := req.(rpc.GetArgs); ok {
-		return kv.DoGet(getArgs)
+// DoOp 施加一条已提交 op；index 是它的 raft 绝对索引。
+// 落盘后端（pebble）用 index 做 apply-id 去重：index <= 已 durable apply 的水位 → 跳过
+// （重启 replay 时已在 pebble 里，避免重复处理）。内存后端 AppliedIndex 恒 -1，从不跳过。
+func (kv *KVServer) DoOp(index int, req any) any {
+	if index <= kv.store.AppliedIndex() {
+		return nil // 已 durable apply，跳过（客户端也不在等这些重放条目）
 	}
-	if putArgs, ok := req.(rpc.PutArgs); ok {
-		return kv.DoPut(putArgs)
+	switch r := req.(type) {
+	case rpc.GetArgs:
+		return kv.doGet(r)
+	case rpc.PutArgs:
+		return kv.doPut(index, r)
 	}
 	return nil
 }
 
-func (kv *KVServer) DoGet(args rpc.GetArgs) rpc.GetReply {
-	// Your code here
-	value, ok := kv.kvMap[args.Key]
-	var reply rpc.GetReply
+func (kv *KVServer) doGet(args rpc.GetArgs) rpc.GetReply {
+	value, version, ok := kv.store.Get(args.Key)
 	if ok {
-		reply.Value = value.Value
-		reply.Version = value.Version
-		reply.Err = rpc.OK
-	} else {
-		reply.Err = rpc.ErrNoKey
+		return rpc.GetReply{Value: value, Version: version, Err: rpc.OK}
 	}
-	return reply
+	return rpc.GetReply{Err: rpc.ErrNoKey}
 }
 
-func (kv *KVServer) DoPut(args rpc.PutArgs) rpc.PutReply {
-	// Your code here
-	value, ok := kv.kvMap[args.Key]
-	reply := rpc.PutReply{}
+// doPut 做版本判定，成功才 store.Put（落盘后端把「写 + appliedIndex=index」同 batch 原子提交）。
+// 被拒（版本不符 / 无 key）不写、不推 appliedIndex —— 重启会重放它、再次被拒，幂等无副作用。
+func (kv *KVServer) doPut(index int, args rpc.PutArgs) rpc.PutReply {
+	_, version, ok := kv.store.Get(args.Key)
 	if ok {
-		if args.Version == value.Version {
-			kv.kvMap[args.Key] = kvEntry{Value: args.Value, Version: value.Version + 1}
-			reply.Err = rpc.OK
-		} else {
-			reply.Err = rpc.ErrVersion
+		if args.Version == version {
+			kv.store.Put(index, args.Key, args.Value, version+1)
+			return rpc.PutReply{Err: rpc.OK}
 		}
-	} else {
-		if args.Version == 0 {
-			kv.kvMap[args.Key] = kvEntry{Value: args.Value, Version: 1}
-			reply.Err = rpc.OK
-		} else {
-			reply.Err = rpc.ErrNoKey
-		}
+		return rpc.PutReply{Err: rpc.ErrVersion}
 	}
-	return reply
+	if args.Version == 0 {
+		kv.store.Put(index, args.Key, args.Value, 1)
+		return rpc.PutReply{Err: rpc.OK}
+	}
+	return rpc.PutReply{Err: rpc.ErrNoKey}
 }
 
-func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	// You can use labgob to turn a Snapshot struct into a byte array.
-	snapshot := Snapshot{KvMap: kv.kvMap}
-	buf := new(bytes.Buffer)
-	w := labgob.NewEncoder(buf)
-	if err := w.Encode(snapshot); err != nil {
-		panic(err)
-	}
-	return buf.Bytes()
-}
-
-func (kv *KVServer) Restore(data []byte) {
-	// Your code here
-	// You can use labgob to turn a byte array into a Snapshot struct.
-	buf := bytes.NewBuffer(data)
-	r := labgob.NewDecoder(buf)
-	var snapshot Snapshot
-	if err := r.Decode(&snapshot); err != nil {
-		panic(err)
-	}
-	kv.kvMap = snapshot.KvMap
-}
+func (kv *KVServer) Snapshot() []byte     { return kv.store.Snapshot() }
+func (kv *KVServer) Restore(data []byte)  { kv.store.Restore(data) }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	err, res := kv.rsm.Submit(*args)
@@ -141,8 +107,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(kvEntry{})
 	labgob.Register(Snapshot{})
 
-	kv := &KVServer{me: me}
-	kv.kvMap = make(map[string]kvEntry)
+	kv := &KVServer{me: me, store: newMapStore()}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
@@ -160,19 +125,17 @@ func NewServer(tc *tester.TesterClnt, ends []*labrpc.ClientEnd, grp tester.Tgid,
 // 稳定 NodeID + 落盘 Persister 装配，供真 binary（cmd/raftkvd）使用。
 // 返回 KVServer 以及其内部 raft（binary 用它挂 RaftService peer 平面）。
 // labrpc 老路 StartKVServer 保持不变，L1 测试不受影响。
-func StartKVServerGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID, w raft.WAL, maxraftstate int) (*KVServer, raftapi.Raft) {
+func StartKVServerGrpc(ends []transport.ClientEnd, me transport.NodeID, nodeIDs []transport.NodeID, w raft.WAL, store KVStore, maxraftstate int) (*KVServer, raftapi.Raft) {
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
 	labgob.Register(kvEntry{})
 	labgob.Register(Snapshot{})
 
-	kv := &KVServer{}
-	kv.kvMap = make(map[string]kvEntry)
+	kv := &KVServer{store: store}
 	kv.rsm = rsm.MakeRSMGrpc(ends, me, nodeIDs, w, maxraftstate, kv)
-	// 快照现由 WAL 持有（fileWAL 内嵌于 wal header）；启动时经 Load 取回做 Restore。
-	if st, _ := w.Load(); len(st.Snapshot) > 0 {
-		kv.Restore(st.Snapshot)
-	}
+	// 不在启动时 Restore：pebble 是 live durable 存储，Open 时已到位到其 appliedIndex；
+	// raft 从 snapshotIndex+1 重放，DoOp 按 appliedIndex 去重即可（角色 A）。快照 blob 只在
+	// 收 InstallSnapshot（角色 B）时经 applyCh 触发 Restore 整库替换。
 	return kv, kv.rsm.Raft()
 }

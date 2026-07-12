@@ -9,6 +9,8 @@ set -uo pipefail
 
 N="${N:-3}"
 BASE_PORT="${BASE_PORT:-6001}"
+MAXRAFT="${MAXRAFT:--1}" # >0 触发快照压缩（pebble.Checkpoint→blob→raft.Snapshot）
+FILL="${FILL:-0}"        # 崩溃前多写 FILL 个填充 key，把日志撑过 MAXRAFT 触发压缩
 HOST=127.0.0.1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/src"
@@ -27,6 +29,7 @@ start_cluster() {
   for ((i=0; i<N; i++)); do
     id="n$((i+1))"; port=$((BASE_PORT + i)); data="$RUN_DIR/data/$id"; mkdir -p "$data"
     "$BIN_DIR/raftkvd" --node-id "$id" --listen "${HOST}:${port}" --data-dir "$data" --peers "$PEERS" \
+      --max-raft-bytes "$MAXRAFT" \
       > "$RUN_DIR/$id.log" 2>&1 &
     PIDS+=($!)
   done
@@ -52,6 +55,11 @@ fail=0
 echo "== 启动集群（第一轮）=="
 start_cluster
 sleep 2 # 给选主一点时间（ctl 自身也会重试找 leader）
+
+if [[ "$FILL" -gt 0 ]]; then
+  echo "== fill ${FILL} keys to grow log past MAXRAFT=${MAXRAFT} =="
+  for ((k=0; k<FILL; k++)); do ctl put "fill$k" "v$k" 0 >/dev/null; done
+fi
 
 echo "== 写入 =="
 for ((k=0; k<${#KEYS[@]}; k++)); do

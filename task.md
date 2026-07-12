@@ -231,33 +231,55 @@ Raft 是 **persist-before-reply**（授票/回 ack 前先落盘），所以"丢�
 ## Step 4 · KV 状态机：内存 map → 磁盘 LSM（pebble）
 
 > 定位见决策 6：这是**存储模型**改造（内存→磁盘、可 > RAM），**不是持久化、不影响正确性**。
-> 本项目纯深度演示，工作量很小（换个状态机后端），价值在把决策 6 那套讲透。
+> 面试深挖区，价值在把决策 6 那套 + apply-id/two-WAL 协调讲透（换后端本身不难，难点在 apply-id 恢复语义）。
 
-拆两小步（决定见对话）：**4a 不碰 raft 快照协议、零风险；4b 才侵入 raft 存 apply-id、放最后。**
+拆两步（分割线见下方"为什么 apply-id 属于 4a"）：**4a = 完整正确的 pebble KV（含 apply-id、复用 raft
+现成 blob 快照协议）；4b = 只做 InstallSnapshot 流式发送的优化，scale-only、可选、大概率白板。**
 
-### Step 4a · KV 状态机换 pebble（raft 快照协议不动）
+### 为什么 apply-id 属于 4a、不是 4b（🟣 要能复述）
 
-> raft 快照的**两个角色**别只看一个：A 本地恢复、B InstallSnapshot 发给落后 follower（协议强制，必须能发）。
-> 4a 里 raft 一行不改——快照仍是 raft 存/发的一个 blob，只是 blob 内容从"map 序列化"变成"**复制整颗 LSM 树**"。
+> 曾经想让 4a"raft 一行不改、apply-id 留 4b"，是**错的分割线**。
 
-- [ ] KV 状态机后端 map → pebble（live 存储，读写落盘、可 > RAM）。go.mod 引 pebble（可拉，goproxy.cn）。
-- [ ] `Snapshot()`：**不遍历序列化**——`pebble.Checkpoint()`（硬链 SSTable，一致）→ 打包 checkpoint 目录成 blob
-      → 交给现有 `raft.Snapshot(index, blob)`。`Restore(blob)`：解包成 pebble 目录 → 打开/替换。
-- [ ] raft 快照协议、InstallSnapshot 收发**照旧**（还是 blob），零 raft 风险。
-- [ ] KV log(fileWAL) 与 pebble 分目录。
-- **验收**：`scripts/test-crash-recovery.sh` 仍 PASS（数据跨 kill -9 存活）；开 maxraftstate>0 让 SaveSnapshot 真触发。
-- 代价（自知）：快照仍是 O(dataset) blob（没拿到 checkpoint 免物化的便宜）、恢复仍从 blob 重建 pebble。4b 才优化。
+状态机一旦 durable（pebble 崩了数据还在），重启就**必须**知道它 apply 到哪了，否则 replay 会**双重 apply**
+（崩前 `Append(x,"a")` 已落 pebble，重启从 log 头重放又来一遍 → `x="aa"`）。绕开 apply-id 的唯一办法是每次重启
+**清空 pebble、从 snapshot+log 全量重建**——那等于把 pebble 的 durability 扔了，pebble 退化成"每次重启重灌的磁盘
+map"，纯脚手架、4b 一来就删。所以 **apply-id 是"durable 状态机"的内在要求，不是可选增强**。而"raft 不动"靠的是
+**复用 raft 现成的 blob 快照协议（角色 B）**，不是靠那个抛弃式的 wipe-restart。
 
-### Step 4b · 解耦：apply-id + 引用式快照（侵入 raft，最后做）
+> raft 快照两个角色：**A 本地恢复**（pebble+apply-id 顶掉，不再用快照）、**B InstallSnapshot 发给落后 follower**
+> （协议强制，必须能发）。4a 里 A 用 apply-id，B 复用 raft 现成 blob 路 → raft 本体几乎不改。
 
-> 见 memory `filewal-embedded-snapshot-tradeoff`：本地恢复根本不用快照，pebble 自身 durable。
+### Step 4a · pebble KV（含 apply-id，复用 raft blob 快照）✅ 完成
 
-- [ ] `apply-id`：每次 apply 把「KV 改动 + apply-id=该 index」放**同一 pebble write batch 原子提交**。重启读
-      apply-id K → 从 raft log `K+1` 续放（≤K 幂等跳过）。这是 two-WAL 协调的锚。
-- [ ] 角色 A 的 blob 拿掉：本地恢复 = 打开 live pebble + 补重放 log 尾，不再从 blob 重建。
-- [ ] 角色 B 改引用式：InstallSnapshot 现切 checkpoint 流式发；收方**整库替换**（快照无 tombstone，不能 merge）。
-- [ ] 两个协调点的顺序铁律：① 压缩：pebble durable≥N 才砍 raft log≤N；② 收 InstallSnapshot：先换 pebble(apply-id=K) 再置 raft snapshotIndex=K。
-- **验收**：`test-crash-recovery.sh`（4a 建立的回归网）仍 PASS + 数据集 > RAM 也能服务 + 落后 follower 经 InstallSnapshot 追齐。
+**实现记录**
+- `kvraft1/kvstore.go`：`KVStore` 接口（基础类型签名）+ `mapStore`（L1，行为等于旧 kvMap）。
+  KV 后端做成**可插拔**——L1 仍用 map（快、确定性），pebble 只进 binary（像 fileWAL）。
+- `kvraft1/pebblestore/`（独立包，import pebble；结构化满足 `KVStore`，不 import kvraft1 → pebble 不进 L1）：
+  Get/Put on pebble；`Put` 把「KV 改动 + `applied_index`」放**同一 batch、`pebble.Sync` 提交**；`Snapshot()`=
+  `pebble.Checkpoint()`（硬链，不遍历）→ tar 打包 blob；`Restore()`=解包→整库替换。
+- `KVServer.DoOp(index, op)`：`index <= store.AppliedIndex()` 跳过（apply-id 去重）；map 恒 -1 不跳。
+  `StateMachine.DoOp` 签名加 index（shardkv/rsm-test 忽略）。
+- binary：raft fileWAL 落 `dataDir/raft`、pebble 落 `dataDir/db`（分目录，决策 5）；不在启动 Restore（live pebble）。
+  新增 `--max-raft-bytes` flag（注意不能叫 `max-raft-state`——tester1 已注册）。
+
+**验收**（全部通过）
+- [x] `scripts/test-crash-recovery.sh` PASS（默认，无快照）：pebble 状态机数据跨 `kill -9` 存活。
+- [x] `MAXRAFT=400 FILL=15 …` PASS：压缩真触发（`raft/wal` 从 2.6KB 涨到 9.5KB，内嵌 pebble checkpoint blob），压缩后恢复仍正确。
+- [x] L1：`go test -race ./kvraft1/` `ok 236s`（map 后端，未受影响）。
+- [x] 磁盘布局：`n1/db/`（真 pebble SSTable/MANIFEST）+ `n1/raft/`（fileWAL meta+wal）。
+- 未覆盖：pebble `Restore`（整库替换）只在收 InstallSnapshot 触发，全崩 crash 测试不走此路（需落后 follower 场景，属 4b/加固）。
+- **验收**：`scripts/test-crash-recovery.sh` 仍 PASS；开 `maxraftstate>0` 让 SaveSnapshot 真触发（走 checkpoint blob）。
+- 自知代价：角色 B 的 blob 仍 O(dataset)、且会内嵌进 fileWAL 的 wal header（lab 数据量可接受）。这正是 4b 的优化点。
+
+### Step 4b · InstallSnapshot 流式 checkpoint（可选优化，scale-only）
+
+> 见 memory `filewal-embedded-snapshot-tradeoff`。**仅当快照大到"塞不进一个 blob / 装不下 RAM"才兑现**，
+> lab 用不到 → 大概率归"懂原理·不写"。
+
+- [ ] 把角色 B 从"bundle 整个 checkpoint 成 blob 走 raft" 改成"**流式发 checkpoint 文件**"，快照不再进 fileWAL、
+      不再整块进内存；wal header 只存引用（applied_index 指向 checkpoint）。
+- [ ] 收 InstallSnapshot 的协调点：先换 pebble(applied_index=K) 再置 raft snapshotIndex=K。
+- **验收**：数据集 > RAM 也能发/收 InstallSnapshot；`test-crash-recovery.sh` 仍 PASS。
 
 ## Step 5 · binary 级端到端对账（真机 kill-all）✅ 完成（全崩场景）
 

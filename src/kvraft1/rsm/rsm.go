@@ -79,7 +79,9 @@ func decodeOp(data []byte) Op {
 // execute an operation (e.g., a Get or Put request), and
 // Snapshot/Restore to snapshot and restore the server's state.
 type StateMachine interface {
-	DoOp(any) any
+	// DoOp 施加一条已提交的 op；index 是它的 raft 绝对索引，供落盘状态机（pebble）做
+	// apply-id 去重（重启 replay 时跳过已 durable apply 的条目）。内存状态机忽略即可。
+	DoOp(index int, op any) any
 	Snapshot() []byte
 	Restore([]byte)
 }
@@ -213,7 +215,7 @@ func (rsm *RSM) readApplyCh() {
 	for msg := range rsm.applyCh {
 		if msg.CommandValid {
 			op := decodeOp(msg.Command.([]byte))
-			res := rsm.sm.DoOp(op.Opcommad)
+			res := rsm.sm.DoOp(msg.CommandIndex, op.Opcommad)
 			rsm.mu.Lock()
 			hashNum, hasHash := rsm.hashNumMap[msg.CommandIndex]
 			ch, hasCh := rsm.chMap[msg.CommandIndex]

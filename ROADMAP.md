@@ -54,12 +54,15 @@
 >   真值永远是「log + snapshot」，状态机丢了能重建；所以它不是"持久化"，是"内存模型→磁盘模型"。
 > 验收：单节点崩溃恢复正确（靠 WAL）；原持久化相关测试绿。
 
-- [ ] 🟣 实现 WAL：currentTerm / votedFor / log entries，正确的 fsync 纪律
-- [ ] 🟣 崩溃恢复测试（kill -9 后重启对账）—— 这是命门，自己想清楚
-- [ ] 🟣 拆分存储：Raft log/metadata（WAL，append-only + fsync）与 KV 状态机分开
-- [ ] 🟢 状态机落 pebble：内存 map → 磁盘 LSM（capacity > RAM），**存储模型改造、非持久化诉求**
-- [ ] 🟢 appliedIndex 与 KV 写入同一 batch 原子提交（two-WAL 协调，落盘状态机唯一真深的点）
-- [ ] 🟢 快照：本地压缩只推 appliedIndex 水位；InstallSnapshot 收到 = 整库替换（快照无 tombstone，不能 merge）
+- [x] 🟣 实现 WAL：term/votedFor/log entries，fsync 纪律（`src/wal` 原语 + `src/filewal` 组合，Step 1–3）
+- [x] 🟣 崩溃恢复测试（kill -9 后重启对账）—— 命门。确定性层 `filewal` 组合对账 + 真机 `scripts/test-crash-recovery.sh` 全绿
+- [x] 🟣 拆分存储：Raft log/metadata（fileWAL，append-only + fsync）与 KV 状态机分开
+- **4a**（做）：状态机落 pebble（map → 磁盘 LSM，> RAM，存储模型改造、非持久化）
+  - [ ] 🟢 **apply-id**：apply 时「KV 改动 + applied_index」同一 pebble batch 原子提交 —— durable 状态机的内在要求
+        （否则重启 replay 双重 apply）；重启开 live pebble、从 K+1 重放。two-WAL 协调，落盘状态机唯一真深的点
+  - [ ] 🟢 快照复用 raft 现成 blob 协议：`Snapshot()`=`pebble.Checkpoint()`（硬链，不遍历）→ blob；收 = 整库替换
+        （无 tombstone，不能 merge）。**raft 快照协议不改**
+- **4b**（可选优化，scale-only，大概率白板）：InstallSnapshot 从 bundle-blob 改流式发 checkpoint（快照大到塞不进 blob/RAM 才需要）
 
 ### 设计决策（🟣 要能复述）—— 为什么 Phase 1 的 FilePersister 不够
 

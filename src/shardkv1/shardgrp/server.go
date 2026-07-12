@@ -55,7 +55,7 @@ type Snapshot struct {
 //
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
-func (kv *KVServer) DoOp(req any) any {
+func (kv *KVServer) DoOp(_ int, req any) any {
 	// RSM 是类型无关的：Submit 进来什么类型，这里就按类型分发。
 	// 迁移类操作复用 shardrpc 里现成的 Args 结构（已在启动时 labgob 注册）。
 	switch args := req.(type) {

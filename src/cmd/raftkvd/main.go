@@ -17,12 +17,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
 
 	"6.5840/filewal"
 	kvraft "6.5840/kvraft1"
+	"6.5840/kvraft1/pebblestore"
 	"6.5840/proto"
 	raft "6.5840/raft1"
 	"6.5840/transport"
@@ -38,6 +40,8 @@ type config struct {
 	listen  string
 	dataDir string
 	peers   map[transport.NodeID]string // NodeID → host:port
+
+	maxRaftState int // 日志字节超过它就触发快照压缩；-1 关闭
 }
 
 func main() {
@@ -83,18 +87,24 @@ func run(cfg config, log *slog.Logger) error {
 		}
 	}()
 
-	// --- 落盘 WAL（Phase 2：真 append-only fileWAL，替代 Phase 1 的全量 blob Persister）---
-	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir data-dir: %w", err)
+	// --- 落盘：raft fileWAL 与 KV pebble **分目录**（决策 5：log 高频顺序 vs 状态机随机读写）---
+	raftDir := filepath.Join(cfg.dataDir, "raft")
+	dbDir := filepath.Join(cfg.dataDir, "db")
+	if err := os.MkdirAll(raftDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir raft dir: %w", err)
 	}
-	fw, err := filewal.Open(wal.OSFS(), cfg.dataDir)
+	fw, err := filewal.Open(wal.OSFS(), raftDir)
 	if err != nil {
 		return fmt.Errorf("open filewal: %w", err)
 	}
+	store, err := pebblestore.Open(dbDir)
+	if err != nil {
+		return fmt.Errorf("open pebble: %w", err)
+	}
 
-	// --- 启动 KV 节点（内部经 rsm 创建 Raft，applyCh 喂 KV 状态机）---
-	// maxraftstate=-1：暂不快照（4a 上 pebble 后再开，测 SaveSnapshot 路径）。
-	kv, rfi := kvraft.StartKVServerGrpc(ends, cfg.nodeID, nodeIDs, fw, -1)
+	// --- 启动 KV 节点（内部经 rsm 创建 Raft，applyCh 喂 KV 状态机 = pebble）---
+	// maxRaftState<0：不快照（log 重放恢复）；>0：日志涨过它就 pebble.Checkpoint→blob→raft.Snapshot 压缩。
+	kv, rfi := kvraft.StartKVServerGrpc(ends, cfg.nodeID, nodeIDs, fw, store, cfg.maxRaftState)
 	rf, ok := rfi.(*raft.Raft)
 	if !ok {
 		return fmt.Errorf("raft 返回类型非 *raft.Raft，无法挂 RaftService")
@@ -140,13 +150,16 @@ func parseFlags() (config, error) {
 		listen  = flag.String("listen", "", "gRPC 监听地址 host:port（如 127.0.0.1:5001）")
 		dataDir = flag.String("data-dir", "", "持久化数据目录")
 		peers   = flag.String("peers", "", "集群成员表：NodeID=host:port，逗号分隔（含本节点）")
+		// 注意：flag 名不能用 "max-raft-state"——tester1 已在 init 注册了它（binary 经 kvraft1→tester1 传递 import）。
+		maxRaft = flag.Int("max-raft-bytes", -1, "raft 日志字节超过它就触发快照压缩；-1 关闭")
 	)
 	flag.Parse()
 
 	cfg := config{
-		nodeID:  transport.NodeID(*nodeID),
-		listen:  *listen,
-		dataDir: *dataDir,
+		nodeID:       transport.NodeID(*nodeID),
+		listen:       *listen,
+		dataDir:      *dataDir,
+		maxRaftState: *maxRaft,
 	}
 	if cfg.nodeID == "" {
 		return cfg, fmt.Errorf("--node-id 必填")
