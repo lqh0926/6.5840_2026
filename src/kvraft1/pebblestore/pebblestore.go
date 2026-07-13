@@ -61,9 +61,17 @@ func (s *Store) Get(key string) (string, rpc.Tversion, bool) {
 	return e.Value, e.Version, true
 }
 
-// Put 把「key=(value,version)」与「applied_index=index」放同一 batch、Sync 原子提交。
+// Put 把「key=(value,version)」与「applied_index=index」放**同一 pebble batch、Sync 原子提交**。
+//
+// 为什么 applied_index 存 pebble、不存 raft 的 meta：它的语义是"pebble 已 durable apply 到 K"，
+// 这个断言必须和它描述的那次 KV 写入**原子**同生共死，而跨两个引擎（pebble + fileWAL/meta）做不到
+// 原子。若分开写，崩在中间必坏其一：① meta 先写 applied=K、pebble 后写 → 崩则跳过 K → **数据丢失**；
+// ② pebble 先写、meta 后写 → 崩则重复 apply（非幂等 op 出错）。放同一 batch → 要么都在要么都不在，
+// 永远自洽。这正是 etcd 把 consistent_index 塞进和 KV 变更同一个 bbolt 事务的原因。applied_index 是
+// **状态机的 metadata**（消费 log 的水位），不是 raft 的（term/votedFor 那些）。
 func (s *Store) Put(index int, key, value string, version rpc.Tversion) {
 	b := s.db.NewBatch()
+	defer b.Close() // Commit 不 close；Close 把 batch 归还 pebble 的 sync.Pool（复用、省 GC）
 	must(b.Set(userKey(key), encodeEntry(entry{Value: value, Version: version}), nil))
 	must(b.Set(appliedKey, encodeIndex(index), nil))
 	must(b.Commit(pebble.Sync)) // fsync：写 + applied_index 一起 durable

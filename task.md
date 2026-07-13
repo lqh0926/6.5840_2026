@@ -259,6 +259,9 @@ map"，纯脚手架、4b 一来就删。所以 **apply-id 是"durable 状态机"
   `pebble.Checkpoint()`（硬链，不遍历）→ tar 打包 blob；`Restore()`=解包→整库替换。
 - `KVServer.DoOp(index, op)`：`index <= store.AppliedIndex()` 跳过（apply-id 去重）；map 恒 -1 不跳。
   `StateMachine.DoOp` 签名加 index（shardkv/rsm-test 忽略）。
+- **决策：apply-id 存 pebble（和 KV 写同 batch），不存 raft meta**——跨引擎无法原子，分开写崩在中间必坏其一
+  （meta 先写→丢数据；pebble 先写→双 apply）。同 batch 才崩溃自洽。等价 etcd `consistent_index`。它是**状态机的
+  metadata**（不是 raft 的 term/votedFor）。详见 `pebblestore.go` Put 注释 / memory `apply-id-atomic-with-data`。
 - binary：raft fileWAL 落 `dataDir/raft`、pebble 落 `dataDir/db`（分目录，决策 5）；不在启动 Restore（live pebble）。
   新增 `--max-raft-bytes` flag（注意不能叫 `max-raft-state`——tester1 已注册）。
 
