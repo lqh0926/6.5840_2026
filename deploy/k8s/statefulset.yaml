@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: raftkv
+  namespace: raftkv
+  labels:
+    app.kubernetes.io/name: raftkv
+spec:
+  # This must name the headless Service. Together they give every ordinal a
+  # stable network identity even when a Pod is deleted and recreated.
+  serviceName: raftkv
+  replicas: 3
+  # Static Raft members should bootstrap in parallel rather than treating
+  # raftkv-0 as an application-level prerequisite for raftkv-1 and raftkv-2.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: raftkv
+  updateStrategy:
+    type: RollingUpdate
+  # Retain is also the default. Keeping it explicit documents that deleting or
+  # scaling the StatefulSet must not silently delete Raft/Pebble data.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: raftkv
+    spec:
+      # raftkvd never calls the Kubernetes API, so it does not need a token.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # A PVC hides the ownership prepared in the image. fsGroup asks the
+        # kubelet/storage driver to make the mounted volume writable by raftkv.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: raftkvd
+          image: raftkv:phase3
+          # kind load docker-image imports this local image into the node.
+          imagePullPolicy: IfNotPresent
+          env:
+            # The downward API reads this Pod's stable StatefulSet name.
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LISTEN
+              value: ":7000"
+            - name: PEER_PORT
+              value: "7000"
+            - name: CLIENT_PORT
+              value: "7001"
+            - name: DATA_DIR
+              value: /var/lib/raftkv
+            - name: REPLICAS
+              value: "3"
+            - name: STATEFULSET_NAME
+              value: raftkv
+            - name: SERVICE_DNS
+              value: raftkv.raftkv.svc.cluster.local
+            - name: MAX_RAFT_BYTES
+              value: "-1"
+          ports:
+            # Both RPC planes still share this listener until Step 7.
+            - name: rpc
+              containerPort: 7000
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/raftkv
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  # StatefulSet expands this template once per ordinal, producing PVCs named
+  # data-raftkv-0, data-raftkv-1, and data-raftkv-2.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

@@ -1,0 +1,9 @@
+# kind runs a real Kubernetes node as a Docker container. One control-plane
+# node is enough for this StatefulSet/PVC exercise; it is not a production HA
+# control plane.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  ipFamily: ipv4
+nodes:
+  - role: control-plane

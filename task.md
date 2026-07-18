@@ -138,12 +138,53 @@ k8s 里不能手写 IP。改成**从稳定身份推导集群成员表**：
   `cap_drop=ALL`、`no-new-privileges=true`（= crash 脚本的容器版 + 决策 7 权限实践）。
 
 ### Step 4 · k8s：StatefulSet + headless Service + PVC 🟢（决策 1/2/3 落地）
-- [ ] **headless Service**（`clusterIP: None`）给每个 Pod 稳定 DNS（peer 平面互联靠它）。
-- [ ] **StatefulSet**：`replicas: 3`、`serviceName: raftkv`、`volumeClaimTemplates`（每 Pod 一块 PVC 挂 DATA_DIR）。
-- [ ] Pod env：downward API 注入 `POD_NAME`→NODE_ID；`REPLICAS`/`SERVICE_DNS`/端口走 env。
-- [ ] 另一个 **Service（ClusterIP/NodePort）暴露 client 端口**给外部读写（peer 端口不对外）。
-- **验收**：`kubectl apply` → 3 Pod Running、选出 leader、`raftkvctl`（或 port-forward）能读写；
-      `kubectl delete pod raftkv-1` → 自动重建、挂回 PVC、数据存活、集群自愈。
+- [x] **headless Service**（`clusterIP: None`）给每个 Pod 稳定 DNS（peer 平面互联靠它）；
+      `publishNotReadyAddresses: true` 避免 peer DNS 被 readiness 门控。
+- [x] **StatefulSet**：`replicas: 3`、`serviceName: raftkv`、`volumeClaimTemplates`（每 Pod 一块 1Gi RWO PVC 挂 DATA_DIR）。
+- [x] Pod env：downward API 注入 `POD_NAME`→NODE_ID；`REPLICAS`/`SERVICE_DNS`/端口走 env；日志实测
+      `node_id=raftkv-1 peers=3 peers_derived=true`。
+- [x] 另一个 **ClusterIP Service** 暴露 client Service 端口 7001。Step 7 前容器仍单监听 7000，故暂时
+      `port: 7001 -> targetPort: rpc(7000)`；双 listener 落地后再把 targetPort 改为 client。
+- **验收**：kind 集群中 3 Pod Running、3 PVC Bound，选主并通过逐 Pod port-forward 完成 put/get；
+  `kubectl delete pod raftkv-1` 后 Pod UID `1f1c... -> bee791...`，PVC UID 始终为 `a909...`，新 Pod
+  仍挂 `data-raftkv-1` 且 Pebble 日志显示重放 2 keys；最终读回 `phase3-step4=k8s-ok (version=1)`，
+  三节点均推进到 `commit=3 applied=3`。
+
+#### Step 4 配置速查（面试复习）
+
+- **文件边界**：`kind-config.yaml` 只给 kind 创建本地集群，不交给 k8s API；`namespace.yaml` 做资源隔离；
+  `services.yaml` 管稳定寻址/暴露；`statefulset.yaml` 管 Pod 身份、生命周期和卷；`kustomization.yaml` 让
+  `kubectl apply -k deploy/k8s` 聚合后三份 k8s 资源。kind 单 control-plane 能测 Pod/PVC 恢复，**不能证明节点级 HA**。
+- **headless Service**：`clusterIP: None` 不分配虚拟 IP、不替 peer 负载均衡，而是让 DNS 直接发布 Pod endpoint；
+  `publishNotReadyAddresses: true` 保证未 Ready 的新节点也能被 peer 发现，避免“先 Ready 才有 DNS、先有 DNS
+  才能组 Raft”的 bootstrap 死锁。稳定地址公式：`<pod>.<service>.<namespace>.svc.cluster.local`。
+- **client Service**：`type: ClusterIP` 只提供集群内稳定入口；本地调试用 `port-forward`，生产再选
+  LoadBalancer/Gateway。`port` 是 Service 入口端口，`targetPort` 是 Pod 容器端口；Step 7 前临时为
+  `7001 -> rpc(7000)`，拆平面后改为 `7001 -> client(7001)`。
+- **StatefulSet 身份**：`serviceName: raftkv` 必须指向 headless Service；`replicas: 3` 产生稳定 ordinal
+  `raftkv-0/1/2`；`podManagementPolicy: Parallel` 让静态 Raft 成员并行 bootstrap；`selector.matchLabels`
+  必须与 `template.metadata.labels` 一致；`RollingUpdate` 逐 Pod 替换（Step 6 再补 leader 交权）。
+- **自动成员表**：downward API 的 `fieldPath: metadata.name` 把稳定 Pod 名注入 `NODE_ID`；
+  `REPLICAS + STATEFULSET_NAME + SERVICE_DNS + PEER_PORT` 推导全部 peer DNS，不依赖动态 Pod IP。
+- **PVC per ordinal**：`volumeClaimTemplates.metadata.name: data` 自动展开成 `data-raftkv-0/1/2`；
+  `ReadWriteOnce + 1Gi`，未写 `storageClassName` 就用集群默认 StorageClass；`volumeMounts.name` 必须和模板名
+  `data` 一致。`whenDeleted/whenScaled: Retain` 保留 StatefulSet 管理的 PVC，但**显式删 PVC、删 namespace、
+  `kind delete cluster` 仍会丢本地数据**。StatefulSet 给稳定身份，真正承载 durability 的是 PVC/PV。
+- **最小权限**：Pod 级 `runAsNonRoot/runAsUser/runAsGroup=65532`；`fsGroup=65532` 解决 PVC 覆盖镜像目录后
+  的写权限，`OnRootMismatch` 避免每次启动递归改 owner；`seccompProfile: RuntimeDefault`。容器级
+  `allowPrivilegeEscalation: false + readOnlyRootFilesystem: true + capabilities.drop: ALL`，只有 PVC 挂载点可写。
+- **生命周期/资源**：`automountServiceAccountToken: false`（进程不用访问 k8s API）；
+  `terminationGracePeriodSeconds: 30` 是 SIGTERM 到 SIGKILL 的排空窗口；`requests` 用于调度，CPU `limits`
+  超限会 throttle，memory `limits` 超限可能 OOMKill。`containerPort` 只是声明/命名端口，真正监听由
+  `LISTEN` 和 Go 的 `net.Listen` 决定。
+
+**面试五问一句话版**
+
+1. **为什么不用 Deployment？** Raft 成员不能互换，需要 StatefulSet 的稳定 ordinal、稳定 DNS 和 ordinal→PVC 绑定。
+2. **为什么 headless Service？** peer 要找到确定节点，不能经普通 Service 把发给 n1 的 RPC 随机负载均衡到 n2。
+3. **为什么发布未 Ready 地址？** peer 发现不能被 readiness 门控，否则新集群可能循环等待、永远选不出主。
+4. **删 Pod 为什么数据还在？** Pod UID 变了，但同 ordinal 挂回同一 PVC；WAL/Pebble 从卷恢复。
+5. **StatefulSet 是否等于持久化？** 不等于；它保证身份和 PVC 绑定，数据耐久仍取决于 PVC/PV、应用 fsync/原子写和备份策略。
 
 ### Step 5 · 探针 readiness / liveness 🟢（决策 4）
 - [ ] 加轻量 health 端点：优先 **gRPC health checking protocol**（`grpc_health_v1`，标准、k8s `grpcProbe` 直接支持）；
