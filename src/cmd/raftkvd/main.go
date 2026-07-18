@@ -19,7 +19,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
-	"strings"
 	"syscall"
 
 	"6.5840/filewal"
@@ -35,20 +34,15 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
-type config struct {
-	nodeID  transport.NodeID
-	listen  string
-	dataDir string
-	peers   map[transport.NodeID]string // NodeID → host:port
-
-	maxRaftState int // 日志字节超过它就触发快照压缩；-1 关闭
-}
-
 func main() {
 	cfg, err := parseFlags()
 	if err != nil {
+		if err == flag.ErrHelp {
+			printConfigUsage(os.Stdout)
+			return
+		}
 		fmt.Fprintln(os.Stderr, "config error:", err)
-		flag.Usage()
+		printConfigUsage(os.Stderr)
 		os.Exit(2)
 	}
 
@@ -124,7 +118,12 @@ func run(cfg config, log *slog.Logger) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(lis) }()
 	log.Info("raftkvd started",
-		"listen", cfg.listen, "data_dir", cfg.dataDir, "peers", len(nodeIDs))
+		"listen", cfg.listen,
+		"peer_port", cfg.peerPort,
+		"client_port", cfg.clientPort,
+		"data_dir", cfg.dataDir,
+		"peers", len(nodeIDs),
+		"peers_derived", cfg.peersDerived)
 
 	// --- 等 SIGTERM/SIGINT 优雅停机 ---
 	sig := make(chan os.Signal, 1)
@@ -140,70 +139,4 @@ func run(cfg config, log *slog.Logger) error {
 		}
 		return nil
 	}
-}
-
-// --- flag 解析 ---
-
-func parseFlags() (config, error) {
-	var (
-		nodeID  = flag.String("node-id", "", "本节点的稳定 NodeID（如 n1），必须出现在 --peers 中")
-		listen  = flag.String("listen", "", "gRPC 监听地址 host:port（如 127.0.0.1:5001）")
-		dataDir = flag.String("data-dir", "", "持久化数据目录")
-		peers   = flag.String("peers", "", "集群成员表：NodeID=host:port，逗号分隔（含本节点）")
-		// 注意：flag 名不能用 "max-raft-state"——tester1 已在 init 注册了它（binary 经 kvraft1→tester1 传递 import）。
-		maxRaft = flag.Int("max-raft-bytes", -1, "raft 日志字节超过它就触发快照压缩；-1 关闭")
-	)
-	flag.Parse()
-
-	cfg := config{
-		nodeID:       transport.NodeID(*nodeID),
-		listen:       *listen,
-		dataDir:      *dataDir,
-		maxRaftState: *maxRaft,
-	}
-	if cfg.nodeID == "" {
-		return cfg, fmt.Errorf("--node-id 必填")
-	}
-	if cfg.listen == "" {
-		return cfg, fmt.Errorf("--listen 必填")
-	}
-	if cfg.dataDir == "" {
-		return cfg, fmt.Errorf("--data-dir 必填")
-	}
-	m, err := parsePeers(*peers)
-	if err != nil {
-		return cfg, err
-	}
-	if _, ok := m[cfg.nodeID]; !ok {
-		return cfg, fmt.Errorf("--node-id %q 不在 --peers 中", cfg.nodeID)
-	}
-	cfg.peers = m
-	return cfg, nil
-}
-
-// parsePeers 解析 "n1=host1:port1,n2=host2:port2" 成 NodeID→addr。
-func parsePeers(s string) (map[transport.NodeID]string, error) {
-	if strings.TrimSpace(s) == "" {
-		return nil, fmt.Errorf("--peers 必填")
-	}
-	m := make(map[transport.NodeID]string)
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		id, addr, ok := strings.Cut(part, "=")
-		id, addr = strings.TrimSpace(id), strings.TrimSpace(addr)
-		if !ok || id == "" || addr == "" {
-			return nil, fmt.Errorf("--peers 条目格式应为 NodeID=host:port，得到 %q", part)
-		}
-		if _, dup := m[transport.NodeID(id)]; dup {
-			return nil, fmt.Errorf("--peers 中 NodeID %q 重复", id)
-		}
-		m[transport.NodeID(id)] = addr
-	}
-	if len(m) == 0 {
-		return nil, fmt.Errorf("--peers 为空")
-	}
-	return m, nil
 }

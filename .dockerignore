@@ -1,0 +1,14 @@
+# Version-control and agent-local metadata are not part of the build context.
+.git/
+.agents/
+.claude/
+.omo/
+
+# Local test/build artifacts can be large and must never enter an image layer.
+.cluster/
+.crashtest/
+pkg/
+*-handin.tar.gz
+**/*.so
+**/pg-*.txt
+**/.DS_Store

@@ -1,312 +1,191 @@
-# Phase 2 · 存储层重做：Raft WAL + 状态机落磁盘（LSM）— 实现任务
+# Phase 3 · Docker + k8s 部署 —— 实现任务
 
-> 面试深挖区，必须吃透。**这里是两条互不相干的轴，别塞进"持久化"一个词：**
-> - **WAL（Raft log/meta）= 真持久化，命门、承重正确性**：append-only + fsync，崩溃后靠它对账重建。
-> - **LSM（KV 状态机）= 存储模型，与持久化/正确性无关**：把 kvstate 从「内存 map」换成「磁盘结构」，
->   让状态可 > RAM（对标 etcd 的 bbolt / TiKV 的 RocksDB）。状态机 durability **不承重正确性**——
->   真值永远是「log + snapshot」，状态机丢了能重建；所以它不是"持久化"，是"内存模型→磁盘模型"。
+> 证明非 toy、脱离本地 3 进程脚本，JD 高频要求。
+> **一句话定位**：Phase 1/2 把系统做**对**（gRPC + WAL + LSM），Phase 3 把它做**得像生产**——
+> 稳定身份 + 稳定卷 + 探针 + 优雅停机 + 两平面分界。**代码增量小，深度全在"为什么这么部署"。**
 >
-> 总验收：① raft1 / kvraft1 全部原测试照旧绿（含 `-race`）；② 真 WAL 自己单测通过；
-> ③ binary 级 kill-all-重启对账正确（数据不丢、不错）。
-> 核心纪律：**先扩接口 → 逐个 persist 调用点替换 → 每步跑 raft1/kvraft1 全回归**，别一把梭。
+> 总验收：① 真 k8s（kind/minikube 即可）N 节点能**选主 + 复制**；② `kubectl delete pod raftkv-1`
+> 后 Pod 重启、**数据还在**、集群自愈；③ 原 6.5840 测试（L1）与 `scripts/test-crash-recovery.sh` 照旧绿
+> （容器化不碰 raft/kv 逻辑，只加宿主/配置/部署层）。
+> 核心纪律：**部署层的改动不得侵入 raft/kvraft 算法路径**（同 Phase 2 的 L1 保命原则）。
 
 ---
 
-## 现状（改造起点）
+## 现状（改造起点，Phase 1/2 交付的 binary）
 
-- `persist.Persister` 只有 `Save(raftstate, snapshot)` —— **全量 blob 原子写**语义。
-- `raft.persist()`（`raft1/raft.go:105`）每次把 `term + 整条 logs + voteFor + snapshotIndex`
-  用 labgob 打包，连同 `snapshot` **整体重写**。连"投一票"都要重写整条 log（O(log) 每次）。
-- 全代码里 **只有 7 个 `rf.persist()` 调用点**，但每个的真实写意图只碰一小块。
-- 已有两个实现：`tester.Persister`（内存，L1 测试用）、`persist.FilePersister`（bundle 文件，binary 用）。
-
-### 7 个 persist() 调用点 → 新接口映射（拆接口的地基）
-
-| # | 位置 | 触发场景 | 实际改了什么 | 应落到的新接口 |
-|---|------|----------|--------------|----------------|
-| 1 | `raft.go:159` | `Snapshot()` | 裁 log 前缀 + 设 snapshot/snapshotIndex | **Compact**(upto, snap) |
-| 2 | `raft.go:184` | `stepDown()` | term / voteFor="" | **SaveMeta**(term, vote) |
-| 3 | `raft.go:209` | RequestVote 授票 | voteFor = candidate | **SaveMeta** |
-| 4 | `raft.go:262` | InstallSnapshot handler | snapshotIndex + 裁 log 前缀 | **Compact** |
-| 5 | `raft.go:317` | AppendEntries 冲突 | 截尾冲突 suffix + append 新 entries | **TruncateSuffix** + **AppendLog** |
-| 6 | `raft.go:436` | `Start()` | append 一条 entry | **AppendLog**(entries) |
-| 7 | `raft.go:459` | `startElection()` | term++ / voteFor=self | **SaveMeta** |
-
-> 观察：7 点里 **3 个只碰元数据**（2/3/7），**2 个只碰 log 追加/截尾**（5/6），**2 个是快照压缩**（1/4）。
-> 现在它们全走"重写整条 log"的 `Save`，这就是要拆的根因——接口只能表达"存全量"，表达不了"追加一条"。
+- **单 binary `cmd/raftkvd`**，配置**只有 flag**（`main.go:147 parseFlags`）：
+  `--node-id` / `--listen` / `--data-dir` / `--peers` / `--max-raft-bytes`。无 env、无 configmap。
+- **`--peers` 是静态手列**的 `n1=host:port,n2=...,n3=...`（含本节点）。本地脚本里写死，**k8s 里没法手列**
+  （Pod IP 动态、副本数可变）→ 这是 Phase 3 服务发现要解决的核心缺口。
+- **两平面 co-locate 一个端口**（`main.go:113-122`）：一个 `net.Listen(cfg.listen)` 上同时挂
+  `RegisterRaftServer`（peer 平面）+ `RegisterKVServer`（client 平面）+ reflection。
+- **优雅停机半成品**（`main.go:129-136`）：SIGTERM/SIGINT → `srv.GracefulStop()`，**但没有 leadership
+  transfer**（注释写着"留到 Phase 3"）。leader 被杀 = 一个选举超时的不可用窗口。
+- **无 health / readiness 端点**：k8s 探针没东西可探。
+- **落盘**：`data-dir/raft`（fileWAL：meta+wal）+ `data-dir/db`（pebble：SSTable/WAL/MANIFEST）。
+  Pod 重启要数据不丢 → 这个目录**必须落在 PVC** 上（决策见下）。
+- **client（`cmd/raftkvctl`）** 靠逐个试 peer + `ERR_WRONG_LEADER` 换下一个来找 leader，退避重试等选主。
+- gRPC 全程 **insecure（无 TLS）**（`raftkvctl` 用 `insecure.NewCredentials()`，`raftkvd` 裸 `NewServer()`）。
 
 ---
 
-## 设计决策（🟣 要能不看代码复述）
+## 设计决策（🟣 要能不看代码复述 —— 这就是面试深挖区）
 
-### 决策 1 · 为什么要扩接口，而非在 FilePersister 内部优化
-`Save(blob)` 只拿到整块字节，**看不到增量**（哪几条是新 append、从哪截尾）。
-真 append-only WAL 的前提是接口能表达"只追加这一条"。所以必须**把 `Save` 拆成按操作分开的方法**，
-raft 在每个调用点告诉存储层"我这次到底干了什么"，存储层才能只 append 而非全量重写。
+### 决策 1 · StatefulSet 不用 Deployment（**必答题**，翻车陷阱 #3）
+Raft 节点是**有状态、有身份**的成员，不是可互换的无状态副本。Deployment 的坑：
+- **Pod 名随机**（`raftkv-7d9f-xktp`）、重建后又换一个 → 节点靠什么名字重新加入集群？找不到彼此。
+- **卷不绑定身份**：重建的 Pod 可能挂到别的卷 / 空卷 → fileWAL+pebble 数据**错配或丢失**（数据是 Raft 命门）。
 
-### 决策 2 · 新接口（方案 A，真 WAL；方案 B 段轮转当白板延伸题）
-```go
-type WAL interface {
-    SaveMeta(term int, vote NodeID)      // 覆盖、极小、频繁 → 小文件原地覆盖
-    AppendLog(entries []LogEntry)        // 追加为主 → append-only + fsync ← 命门
-    TruncateSuffix(fromIndex int)        // 冲突截尾（丢尾部）
-    Compact(uptoIndex int, snap []byte)  // 快照 + 丢 log 前缀
-    Load() (State, error)                // 启动重放/恢复
-}
-```
-> 签名以实现时最终为准，`LogEntry`/`NodeID` 复用 raft1/transport 现有类型。
-> `SaveMeta` 独立小文件覆盖，不进 WAL（WAL 是 append-only，覆盖语义放这里是污染）。
+StatefulSet 给两个稳定保证，正好对上 Raft 的两个需求：
+- **稳定网络标识**：Pod 名固定 `raftkv-0/1/2`，配 headless Service 得稳定 DNS
+  `raftkv-0.raftkv.<ns>.svc.cluster.local` → 节点用**固定 DNS 名**互相寻址，Pod 漂移（换 IP）不影响。
+- **稳定存储**（`volumeClaimTemplates`）：每个 ordinal 绑**自己那块 PVC**，重建后**挂回同一卷** → 数据跨重启存活。
+  这直接兑现 Phase 2 的 durability：fileWAL/pebble 落 PVC，`kubectl delete pod` = 一次真 crash-restart。
 
-### 决策 3 · 两份实现，保住 L1（关键）
-raft 依赖新接口，给**两份实现**：
-- **`adapter over tester.Persister`（L1 用）**：新接口每个方法都落到
-  「更新内存里的全量模型 → 调旧 `Save(整 blob)`」，**行为逐字节等于今天**。
-  必须 wrap `tester.Persister`（durable 字节跨重启活在它里面，崩溃恢复才成立）。
-  → L1 测的是**算法正确性**，不测 WAL。
-- **`fileWAL`（binary 用）**：真 append-only record + fsync + 重放。
-  → 它的 append/truncate/compact/fsync 正确性**自己单测** + binary 级 kill-all-重启对账。
+### 决策 2 · 服务发现 / bootstrap：从"手列 peers"到"从身份派生"（🟣 核心）
+k8s 里不能手写 IP。改成**从稳定身份推导集群成员表**：
+- **NodeID = Pod 序号身份**：`$POD_NAME`（downward API 注入，等于 hostname `raftkv-0`）→ 直接当 NodeID。
+  稳定、可复述、Pod 重建后不变。取代手传 `--node-id`。
+- **peers 从"副本数 + StatefulSet 名 + headless Service 域"生成**：已知 `replicas=N`、`raftkv`、`.raftkv.<ns>.svc`，
+  就能算出 `raftkv-0.raftkv.<ns>.svc:PORT ... raftkv-(N-1)...`。**不再手列 host:port**，只传 `--replicas`（或读 env）。
+- **静态成员集（本项目边界）**：副本数固定、成员集编译期已知（**不做动态成员变更**——joint consensus 归"懂原理·不写"）。
+  bootstrap = 所有节点用同一份派生的成员表启动，选主自然发生。DNS 未就绪的 peer：gRPC ClientEnd 惰性连接，重试即可。
 
-> 为什么不让 L1 直接跑 fileWAL：L1 焊死 labrpc + 内存模型是确定性回归网，
-> 引入真磁盘 I/O 会让回归变慢变脆；WAL 正确性用专门单测 + binary 对账，职责分离。
+### 决策 3 · PVC per Pod：durability 的落地点
+- `volumeClaimTemplates` 每 ordinal 一块 PVC，挂到容器的 `--data-dir`。
+- Pod 重启/重调度 → StatefulSet 保证挂回**同名 PVC** → fileWAL+pebble 原样还在 → Raft 从 log/snapshot 恢复。
+- **验证口径**：`kubectl delete pod raftkv-1` 就是 Phase 2 kill-9 测试的 k8s 版；数据必须存活、集群自愈。
 
-### 决策 4 · fsync 纪律（命门，面试必答）
-- `AppendLog` **fsync 成功后才算持久化**，且**必须在 commitIndex 推进之前**
-  （否则 leader 认为已提交、崩溃后 log 却没落盘 → 丢已提交数据）。
-- `Compact`：**snapshot fsync 成功后，再删 log 前缀**（顺序不能反，否则崩在中间 → 前缀和快照都没了）。
-- `TruncateSuffix`：截尾要持久化后才能接受更前的新 entries。
-- 元数据（term/vote）覆盖写也要 fsync 后才算数（投票持久化是不重复投票的地基）。
+### 决策 4 · 探针语义：readiness ≠ "是不是 leader"（🟣 易错深挖点）
+- **liveness（活着吗）**：进程在、gRPC 端口能应答即可。挂了 → k8s 重启 Pod。**判据要弱**——
+  别拿"是 leader"做 liveness，否则所有 follower 被反复重启（灾难）。做法：gRPC health check / 一个轻量 TCP/HTTP ping。
+- **readiness（能进 Service endpoint 吗）**：能**参与集群**即 ready（Raft 已起、applyCh 在推进、能转发/服务读写），
+  **不是"必须是 leader"**。若拿 leadership 当 readiness gate → 只有 1 个 Pod 进 endpoint，peer 平面 DNS 还没 ready
+  就无法互联 → **死锁选不出主**。**peer 平面（节点互联）不能被 readiness 门控**——这是关键。
+- 结论：readiness 判"本节点 Raft 存活且不落后太多"，leader 重定向交给 **client 平面的重试**（现成，`raftkvctl` 已做）。
 
-### 决策 5 · Raft log 与 KV 状态机分离存储（翻车陷阱 #1）
-- Raft log/metadata → WAL（append-only 高频小写 + fsync）。
-- KV 状态机 → LSM（pebble），独立目录。
-- 二者写模式完全不同（log 高频顺序追加 vs 状态机随机点查/范围扫），混存互相拖累。这是分离目标。
+### 决策 5 · 优雅停机 + leadership transfer（🟣 自己写，有 raft 依赖）
+- 现状 `srv.GracefulStop()` 只停止收新请求、放干在途 RPC，**不主动交权** → leader 被停 = 等一个选举超时才有新 leader。
+- 目标：SIGTERM 时**若本节点是 leader，先把 leadership 转给最跟得上的 follower，再退**，把不可用窗口从"选举超时"压到"一次 RTT"。
+- **raft 依赖（诚实标注）**：课程 raft **没有 `TransferLeadership`**。两条路：
+  - (a) 🟣 给 raft 加**最小版转移**：leader 选一个 `matchIndex` 最高的 follower，给它发 `TimeoutNow`（或复用一次
+    立即触发选举的信号）让它**立刻发起选举**、自己 stepDown 不再参选。小改动、面试可讲。
+  - (b) ⚪ 不改 raft，停机只 `GracefulStop`，**接受一个选举超时的窗口**，把 (a) 当白板延伸。
+  - **本项目建议 (a) 的最小版**（这是 Phase 3 少数值得动 raft 的地方；否则 Phase 3 全是 YAML，深度不够）。
+- k8s 配套：`preStop` hook + `terminationGracePeriodSeconds` 给足转移 + graceful drain 的时间，避免 SIGKILL 打断。
 
-### 决策 6 · LSM 的价值 = 存储模型（内存→磁盘），不是持久化（🟣 面试防坑）
+### 决策 6 · 拆分 peer / client 两个平面（🟣 **本 Phase 最重的自己写区**，对标 etcd 2380/2379）
+现状两平面 co-locate 一个端口是 Phase 1 的**刻意简化**，Phase 3 落地生产级分界。**三个必答理由**：
+1. **TLS 信任域不同**：peer 平面是**节点↔节点**（内部，宜 **mTLS 双向**）；client 平面是**外部↔leader**（单向 server TLS）。
+   混在一个端口 = 一套证书策略套两个信任域，讲不清。
+2. **网络暴露不同**：peer 只该在**集群内网**可达（k8s NetworkPolicy 限死 pod↔pod）；client 要对外暴露（Service/Ingress）。
+   一个端口没法分别设暴露面。
+3. **资源隔离**：client 洪峰不能**饿死 Raft 心跳/复制** → 心跳延迟 → 误触发选举 → 集群抖动。分端口 = 分 goroutine/连接池/限流域。
+- **落地**：`raftkvd` 起**两个 `net.Listen`**（peer `:PEER_PORT` 挂 RaftService、client `:CLIENT_PORT` 挂 KVService+reflection）；
+  两个 `grpc.Server`。k8s 里 headless Service 只暴露 peer 端口给内部、另开 Service 暴露 client 端口。
+- **连带改造**：`transport/grpc.ClientEnd` 现在一条 conn 假设"一个 peer 一个地址"。peer 平面互联只需 peer 端口
+  （raftCli），不再和 kvCli 捆在一起；派生 peers 时地址用 peer 端口。
+- **对称收尾**（顺手做）：KV client 平面的 `Call` 统一成收 **kv 的 Go 结构体**（当前 `KVService`/`raftkvctl` 仍直传 proto），
+  和 Raft 平面对称（Raft 平面已是 Go 结构体 + transport 层翻译）。
+- **必答题延伸**：为什么 etcd 分 `2379`（client）/`2380`（peer）？就是上面 ①②③。
 
-**别把 Step 4 讲成"给状态机补持久化"——那是错的，也不影响正确性。** 正确框架：
+### 决策 7 · 运行时最小权限：只给 raftkv 写数据目录
 
-- **状态机的 durability 不承重正确性**：Raft 保证状态机永远能从「持久化的 log + 持久化的 snapshot」
-  重建。状态机在内存 map（崩了丢、重建）还是在 pebble（崩了还在、但也可以丢了重建）——正确性一样。
-  真值（source of truth）是 log+snapshot，状态机存储只是它俩的一个物化视图。
-- **pebble 的唯一实义 = 把 kvstate 从「内存模型」变成「磁盘模型」**：状态可以大于 RAM，冷数据在盘、
-  热集在 block cache。对标 etcd（bbolt）/ TiKV（RocksDB）。这是**容量/存储模型**问题，不是持久化。
-- **"快照"的两条路要分清**（否则会得出"pebble 没用"的错误结论）：
-  | | 本地压缩（高频、纯本地） | InstallSnapshot RPC（罕见、走网络） |
-  |---|---|---|
-  | blob 方案 | 每次全量重序列化整个 map | 传输 O(数据集) + 接收方整块解码重建 |
-  | pebble 方案 | 只推 appliedIndex 水位 + 砍 log 前缀，**不重序列化** | **一样** O(数据集)，谁都逃不掉 |
-  pebble 的好处全在**本地压缩**这条高频路；InstallSnapshot 那条本就罕见、且任何引擎都是全量重建。
-- **一个真 gotcha（面试可讲）**：快照是 live key 镜像、**不带删除（tombstone）**，所以把收到的
-  InstallSnapshot 装进一个已有数据的 pebble 时**不能 merge**（旧 key 不会被"删"掉）——只能**整库替换**
-  （另建 pebble 灌满 → 原子换掉旧的）。TiKV region snapshot 即此做法。
-- **成本诚实**：lab 数据量下这些好处都看不到（map 小、重序列化不要钱）→ Step 4 在本项目是**纯深度演示**，
-  不是功能刚需。保留它的理由是"面试深挖区、把上面这套讲清"，不是"项目需要它"。工作量很小（换个后端）。
+容器隔离不等于可以默认用 root。本项目的 raftkv 只需要绑定高位端口和写数据目录，
+不需要 root 身份、Linux capabilities、提权或可写根文件系统。
 
----
-
-## Step 1 · 扩接口 + adapter（不碰真 WAL，先保 L1 绿）✅ 完成
-
-> 目标：把 7 个 `rf.persist()` 换成语义化调用，但底座仍是"更新全量模型→旧 Save"，
-> **行为逐字节不变**。这一步跑通即证明"接口拆得对、映射对"，是最安全的第一步。
-
-**实现记录**
-- `raft1/wal.go`：`WAL` 接口（`SaveMeta`/`AppendLog`/`TruncateSuffix`/`SaveSnapshot`/`Load`）+
-  `PersistState` + `persisterWAL` 适配器 + 唯一编码真源 `encodeRaftState`/`decodeRaftState`。
-  - **接口放 `raft1` 包**（不放 `persist/`）：接口引用 `LogEntry`（raft 类型），若放 persist 会
-    `persist→raft1→persist` 循环。真 fileWAL（Step 3）在独立包实现 `raft1.WAL` 并 import raft1，
-    raft1 靠依赖注入拿实现、不反向 import，无环。
-  - **接口只 5 个方法（非 6）**：InstallSnapshot 与服务层 Snapshot 结果形态一致
-    （`[哨兵]+suffix`），差异仅在 sentinelTerm/suffix 由调用点算好传入 → 用一个 `SaveSnapshot`
-    统一，不在持久化层重推两套日志变换。两处调用点因此是**同一行** `SaveSnapshot(idx, logs[0].Term, snap, logs[1:])`。
-  - adapter 关键正确性：① 构造时从底层 seed 全量模型（否则首写用空 logs 覆盖磁盘）；
-    全新节点 seed 哨兵 `[{Term:0}]` 与 Make 字面量一致。② `SaveSnapshot` 复制 suffix（传入是
-    `rf.logs[1:]`，与 rf 共享底层数组，不复制会被 rf 后续改动污染）。
-- `raft1/raft.go`：加 `wal WAL` 字段；删 `persist()`/`readPersist()`；7 个调用点逐一替换；
-  Make 启动读走 `wal.Load()`。site5（冲突）= `TruncateSuffix(logIdx)` + `AppendLog(entries)` 两步。
-
-**验收**（全部通过）
-- [x] `go build ./raft1/... ./kvraft1/... ./shardkv1/...`（`main/` 旧 lab 的报错是既有、无关）
-- [x] `go test -race ./raft1/` 全绿（3A–3D 含持久化/快照）—— `ok 416.5s`
-- [x] `go test -race ./kvraft1/` 全绿（4A/4B，重度走 SaveSnapshot）—— `ok 271.4s`
-- [ ] （可选加固）`make RUN=... shardkv` 抽样，确认 rsm→raft 持久化路径无碍
-
-## Step 2 · 崩溃恢复单测（命门，自己想清楚）✅ 完成
-
-> 在换真 WAL **之前**先把对账测试写好，作为 fileWAL 的验收标尺。
-
-**实现记录**（新包 `src/wal/`，12 个测试全绿含 `-race`）
-- 底层原语（Step 3 会复用）：`record.go` 崩溃安全 append-only record log（`[len][crc32][payload]`，
-  replay 撞 torn 即截断）；`atomic.go` `AtomicWrite`（tmp→fsync→rename→fsync dir）；`fs.go` 可注入
-  `FS`/`File` seam + `OSFS`。
-- 故障注入：`fakefs_test.go` 的 `memFS`（立即持久化悲观模型），能造：写一半崩 / rename 前崩 / rename 后崩。
-- 三契约 + 三负向变体：
-  - #1 replay 抗 torn：`record_test.go`（torn header/payload、crc 位翻转）+ 负向 `replayRecordsNoCRC`（漏过位翻转）。
-  - #2 meta 原子：`atomic_test.go`（三崩溃点 path 恒非旧即新）+ 负向 `atomicWriteInPlace`（原地覆盖会撕裂）。
-  - #3 SaveSnapshot 顺序：`ordering_test.go`（snapshot 先→空隙可恢复）+ 负向"反序"（先删前缀→丢已提交数据）。
-- 负向变体全部断言"能被对账检查抓到"，证明测试是承重的、非摆设。
-
-### 测什么：不是 Raft 算法，是"save 有没有兑现契约"
-
-Raft 是 **persist-before-reply**（授票/回 ack 前先落盘），所以"丢掉没 fsync、没 ack 的写"**算法本身
-就容忍**（peer 重发），这类 fault **价值低、不测**。crash 测试测的是 **WAL 有没有兑现算法赖以成立的那个
-"save"契约**——三条契约，前两条与"没回就没事"正交，第三条恰恰是 persist-before-reply 保护不到的：
-
-1. **replay 抗 torn tail**（不是"丢没丢"，是"读回来是不是垃圾"）：崩在 record 写一半。naive 实现会
-   panic（起不来=可用性）或把垃圾当合法 record 读进来（带错 term/log 起来 → 再去投票/ack → **安全性破**）。
-   契约：replay 必须在**最后一条完整 record** 处干净截断。
-2. **meta 覆盖原子**（旧 or 新，永不撕裂）：term/votedFor 覆盖崩在中间，非原子写 → 读回撕裂的 votedFor
-   → 同 term 投两次 → 脑裂。契约：靠 rename，读到的永远是完整旧值或完整新值。
-3. **SaveSnapshot 顺序**（persist-before-reply 够不到的地方）⭐：压缩丢弃的是**早就 committed / applied /
-   ack 过**的前缀，reply 是过去发生的。顺序反了（compact marker 先 durable、snapshot 没落）+ 崩在中间
-   → 丢已提交数据、本地无法重建。契约：snapshot 必须先 durable，才允许物理动 log 前缀。
-
-### 怎么测：注入 seam + 负向变体
-
-- [x] fileWAL 写盘走可注入 seam（`FS`/`File`），fake 能：① 写一半崩 ② rename 前/后崩。生产用 `OSFS`。
-- [x] **不变式断言**：torn 尾巴干净截断不 panic；meta 非旧即新不撕裂；SaveSnapshot 崩在 snapshot-已落/
-      前缀-未删时 → 用完整 log 恢复、零丢失。
-- [x] **负向变体（让测试立得住）**：(a) `replayRecordsNoCRC` 不校验 crc、(b) `atomicWriteInPlace` 原地覆盖、
-      (c) 反序压缩 —— 三个都断言"能被抓到"（必须 fail），非摆设。
-- [→ Step 3] **端到端对账用例**（随机 op 序列 → 崩 → `Load()` 对账）需要真 fileWAL 的 `Load()`，随 Step 3
-      的 fileWAL 一起落地：把这三契约的原语组合成 `raft1.WAL` 后，跑组合层的随机序列对账。
-
-## Step 3 · 实现 fileWAL（真 append-only + fsync + 重放）
-
-### 核心机关：两把原语（崩溃安全 ≠ 让单次 write+fsync 原子）
-
-崩溃能砸在 write 中间，挡不住。所以**按写模式选原语**，不在那一层求原子：
-
-- **整文件重写（meta / snapshot）→ 原子性来自 `rename`**：写 tmp → fsync(tmp) → rename → fsync(dir)。
-  rename 是 POSIX 保证的目录项一次性换 inode，读者只见完整旧或完整新。**直接复用 `persist/file.go`
-  的 `atomicWrite`**（注：它吞了 dir-fsync 的 error，真 WAL 想严谨可 propagate）。
-  - 两个 fsync 顺序不能变：fsync(tmp) 在 rename **前**（换过去的 inode 要有真数据）；fsync(dir) 在
-    rename **后**（持久化的是 rename 这个目录项改动，rename 得先发生）。
-- **尾部追加（log）→ 正确性来自 replay 校验**：record = `[len:u32][crc32:u32][payload]`。append-only
-  下崩溃只砸没落盘的尾巴，已 fsync 的老 record 不会被后来的崩溃碰坏。
-
-### 决策：压缩用**整体重写**，不做分段（🟣 要能复述）
-
-- **重写的是"活尾巴"（index > snapshotIndex），不是整条 log**。`snapshotIndex = appliedIndex`，稳态下
-  applied ≈ 最新，活尾巴恒短（受在途复制窗口界定，非历史总量）。→ 压缩**再频繁**，每次重写也 O(小)：
-  压缩本身在删历史，你只拷没被快照盖住的那点尾。"频繁压缩 = 频繁全量拷"是错觉。
-- **分段的唯一好处（免重写、O(1) unlink 回收）只在"活 log 很大"时兑现**，本项目活尾恒小 → 不触发；
-  而分段要背 4 块复杂度（段 roll / 段→区间索引 / 段 GC / Load 跨段+骑跨段前缀跳过）。→ **不划算**。
-- 结论：**重写 over 分段**。热路径 append 两者都 O(1)（这才是 WAL 对"全量 blob 重写"的核心收益，重写
-  方案 100% 拿到）；只在冷路径压缩用一次小重写，换掉整个分段体系。分段留作白板题（"etcd 为什么分段"
-  = 活 log 大到重写不可接受时，用 O(1) unlink 换 O(活尾)重写）。
-
-### 文件布局（实现：两份文件，snapshot 内嵌 wal —— 见下方取舍）
-
-- `meta`：term / votedFor —— 高频覆盖，原子 rename（原语1）。
-- `wal`：可选 `header`(内嵌 base=(N,T) + **snapshot 字节**) + 一串 entry / truncate record。正常 append；压缩时整体重写。
-
-> **取舍：snapshot 内嵌 wal header，不做独立快照文件**（偏离最初"独立文件+顺序铁律"的设想，更简）。
-> `SaveSnapshot` = 一次 `AtomicWrite` 重写整个 wal（header含snapshot + suffix），于是"落快照"与"丢弃前缀"
-> 在**同一次原子写**里提交 → **顺序 hazard 直接消失**，独立快照文件的 orphan/GC 也不存在。代价：压缩重写
-> wal 会连快照一起拷（O(snapshot)），但压缩本就要写新快照、且本项目数据小，可接受。契约 #3 的"顺序"
-> 在此设计下退化为"单次原子写"（Step 2 的顺序测试仍留作原理演示：证明"分两次写时"为何必须有序）。
-
-### 各操作实现 ✅ 完成（新包 `src/filewal/`，组合 `src/wal/` 原语）
-
-- [x] `AppendLog`：`RecordLog.Append` 到 wal 尾 → **fsync 后才返回**（回 ack 前须 durable，决策 4）。
-- [x] `TruncateSuffix`：append `truncate-to-K` marker（纯 append，不原地改历史）；replay 撞到丢 ≥K。
-      site5（冲突）= truncate marker 后紧跟新 entry 的 append，replay 顺序处理 → 旧尾先逻辑丢、再灌新。
-- [x] `SaveMeta`：`meta` 文件原子覆盖（`AtomicWrite`），不进 wal。
-- [x] `SaveSnapshot`：`AtomicWrite` 整体重写 wal = `header(N,T,snapshot)` + suffix 条目，**一次原子提交**。
-- [x] `Load` 重建算法（6.5840 不涉及的净新增，一致性保证所在）：读 meta → 解析 wal record：首条若 header
-      取 base=(N,T)+内嵌 snapshot、log 置 `[sentinel@N(T)]`；其余 entry 追加 / truncate 丢 ≥K；撞坏即截断。
-      **不变式：log 起点锚定 snapshotIndex（从 header 反推，不信物理布局）** → raft 永不见"snap@10 但 log@5"。
-- [x] **组合对账测试**（Step 2 延后的那条）：`filewal_test.go` round-trip 逐字段对账 + 崩溃注入
-      （SaveMeta 写 tmp 崩 / append 写一半崩 / 压缩 rename 前后崩）→ 重启 Load 均自洽零丢失。
-- **验收**：`go test -race ./filewal/ ./wal/` 全绿（filewal 5 组、wal 12 个）；raft1/kvraft1 build 不受影响。
-
-### binary 注入 ✅ 完成
-
-- [x] `raft.MakeWithWAL(peers, me, nodeIDs, wal, applyCh)`；`Make` 委托 `newPersisterWAL`（L1 路径不动）。
-      WAL 接口加 `Size()`（PersistBytes 走它，不再依赖 persister）；fileWAL 的 `Size()` 只算日志字节、不含内嵌快照。
-- [x] WAL 顺 `StartKVServerGrpc → MakeRSMGrpc` 传下去（**只改 grpc 变体**）；`cmd/raftkvd` 构造 `filewal.Open(OSFS, dataDir)` 注入。
-- [x] KV 层快照读：`StartKVServerGrpc` 改为 `w.Load().Snapshot` 做 Restore（不再 `persister.ReadSnapshot`）。
-- [x] 回归：`go test -race ./raft1/`（3A–3D，强制 `-count=1`）`ok 400s`；`./kvraft1/` `ok 249s`；filewal/wal 全绿。
-
-## Step 4 · KV 状态机：内存 map → 磁盘 LSM（pebble）
-
-> 定位见决策 6：这是**存储模型**改造（内存→磁盘、可 > RAM），**不是持久化、不影响正确性**。
-> 面试深挖区，价值在把决策 6 那套 + apply-id/two-WAL 协调讲透（换后端本身不难，难点在 apply-id 恢复语义）。
-
-拆两步（分割线见下方"为什么 apply-id 属于 4a"）：**4a = 完整正确的 pebble KV（含 apply-id、复用 raft
-现成 blob 快照协议）；4b = 只做 InstallSnapshot 流式发送的优化，scale-only、可选、大概率白板。**
-
-### 为什么 apply-id 属于 4a、不是 4b（🟣 要能复述）
-
-> 曾经想让 4a"raft 一行不改、apply-id 留 4b"，是**错的分割线**。
-
-状态机一旦 durable（pebble 崩了数据还在），重启就**必须**知道它 apply 到哪了，否则 replay 会**双重 apply**
-（崩前 `Append(x,"a")` 已落 pebble，重启从 log 头重放又来一遍 → `x="aa"`）。绕开 apply-id 的唯一办法是每次重启
-**清空 pebble、从 snapshot+log 全量重建**——那等于把 pebble 的 durability 扔了，pebble 退化成"每次重启重灌的磁盘
-map"，纯脚手架、4b 一来就删。所以 **apply-id 是"durable 状态机"的内在要求，不是可选增强**。而"raft 不动"靠的是
-**复用 raft 现成的 blob 快照协议（角色 B）**，不是靠那个抛弃式的 wipe-restart。
-
-> raft 快照两个角色：**A 本地恢复**（pebble+apply-id 顶掉，不再用快照）、**B InstallSnapshot 发给落后 follower**
-> （协议强制，必须能发）。4a 里 A 用 apply-id，B 复用 raft 现成 blob 路 → raft 本体几乎不改。
-
-### Step 4a · pebble KV（含 apply-id，复用 raft blob 快照）✅ 完成
-
-**实现记录**
-- `kvraft1/kvstore.go`：`KVStore` 接口（基础类型签名）+ `mapStore`（L1，行为等于旧 kvMap）。
-  KV 后端做成**可插拔**——L1 仍用 map（快、确定性），pebble 只进 binary（像 fileWAL）。
-- `kvraft1/pebblestore/`（独立包，import pebble；结构化满足 `KVStore`，不 import kvraft1 → pebble 不进 L1）：
-  Get/Put on pebble；`Put` 把「KV 改动 + `applied_index`」放**同一 batch、`pebble.Sync` 提交**；`Snapshot()`=
-  `pebble.Checkpoint()`（硬链，不遍历）→ tar 打包 blob；`Restore()`=解包→整库替换。
-- `KVServer.DoOp(index, op)`：`index <= store.AppliedIndex()` 跳过（apply-id 去重）；map 恒 -1 不跳。
-  `StateMachine.DoOp` 签名加 index（shardkv/rsm-test 忽略）。
-- **决策：apply-id 存 pebble（和 KV 写同 batch），不存 raft meta**——跨引擎无法原子，分开写崩在中间必坏其一
-  （meta 先写→丢数据；pebble 先写→双 apply）。同 batch 才崩溃自洽。等价 etcd `consistent_index`。它是**状态机的
-  metadata**（不是 raft 的 term/votedFor）。详见 `pebblestore.go` Put 注释 / memory `apply-id-atomic-with-data`。
-- binary：raft fileWAL 落 `dataDir/raft`、pebble 落 `dataDir/db`（分目录，决策 5）；不在启动 Restore（live pebble）。
-  新增 `--max-raft-bytes` flag（注意不能叫 `max-raft-state`——tester1 已注册）。
-
-**验收**（全部通过）
-- [x] `scripts/test-crash-recovery.sh` PASS（默认，无快照）：pebble 状态机数据跨 `kill -9` 存活。
-- [x] `MAXRAFT=400 FILL=15 …` PASS：压缩真触发（`raft/wal` 从 2.6KB 涨到 9.5KB，内嵌 pebble checkpoint blob），压缩后恢复仍正确。
-- [x] L1：`go test -race ./kvraft1/` `ok 236s`（map 后端，未受影响）。
-- [x] 磁盘布局：`n1/db/`（真 pebble SSTable/MANIFEST）+ `n1/raft/`（fileWAL meta+wal）。
-- 未覆盖：pebble `Restore`（整库替换）只在收 InstallSnapshot 触发，全崩 crash 测试不走此路（需落后 follower 场景，属 4b/加固）。
-- **验收**：`scripts/test-crash-recovery.sh` 仍 PASS；开 `maxraftstate>0` 让 SaveSnapshot 真触发（走 checkpoint blob）。
-- 自知代价：角色 B 的 blob 仍 O(dataset)、且会内嵌进 fileWAL 的 wal header（lab 数据量可接受）。这正是 4b 的优化点。
-
-### Step 4b · InstallSnapshot 流式 checkpoint（可选优化，scale-only）
-
-> 见 memory `filewal-embedded-snapshot-tradeoff`。**仅当快照大到"塞不进一个 blob / 装不下 RAM"才兑现**，
-> lab 用不到 → 大概率归"懂原理·不写"。
-
-- [ ] 把角色 B 从"bundle 整个 checkpoint 成 blob 走 raft" 改成"**流式发 checkpoint 文件**"，快照不再进 fileWAL、
-      不再整块进内存；wal header 只存引用（applied_index 指向 checkpoint）。
-- [ ] 收 InstallSnapshot 的协调点：先换 pebble(applied_index=K) 再置 raft snapshotIndex=K。
-- **验收**：数据集 > RAM 也能发/收 InstallSnapshot；`test-crash-recovery.sh` 仍 PASS。
-
-## Step 5 · binary 级端到端对账（真机 kill-all）✅ 完成（全崩场景）
-
-> 唯一让"组合后的 fileWAL"撞真 fsync + 真 kill -9 的测试。也作为 4a/4b 的回归网。
-
-- [x] `scripts/test-crash-recovery.sh`：起 3 节点 → 写 4 个 KV → `kill -9` 全部 → 重启同数据目录 → 校验全部存活。
-      **PASS**（fileWAL 真落盘 `meta`+`wal`；重启经 raft 重放 log 重建 KV）。
-- [ ]（可选加固）leader-only 崩 / follower-only 崩两种局部场景；version 单调专项校验。
-- 注：当前状态机是内存 map、`maxraftstate=-1`（快照关）→ 测的是 log 重放恢复。4a 开快照后重跑，覆盖 SaveSnapshot。
+- **镜像**：使用 distroless `nonroot` 的 UID/GID `65532:65532`；`COPY --chown=65532:65532` 预创建
+  `/var/lib/raftkv`；`USER 65532:65532`。二进制 root-owned + `0755` 也能执行，数据目录则必须可写。
+- **docker-compose**：显式 `user: "65532:65532"`、`read_only: true`、`cap_drop: [ALL]`、
+  `security_opt: [no-new-privileges:true]`；只把每节点自己的 named volume 挂到 `/var/lib/raftkv`。
+- **Kubernetes**：`runAsNonRoot/runAsUser/runAsGroup=65532`、`allowPrivilegeEscalation: false`、
+  `readOnlyRootFilesystem: true`、`capabilities.drop: [ALL]`、`seccompProfile: RuntimeDefault`。Pod 级设
+  `fsGroup: 65532`，因为 PVC 挂载会覆盖镜像里预创建目录的 ownership；若存储驱动不支持
+  `fsGroup`，再用最小 initContainer 只修正该卷权限，不让主容器跑 root。
+- **验收**：`docker top` 看到 UID 65532；非 root 能创建 WAL/Pebble；root filesystem 只读时仍能运行；
+  卷目录 owner/group 与写权限正确。
 
 ---
 
-## 验收总表（每步的硬门槛）
+## Steps（按依赖排序；每步跑 L1 + crash 脚本回归）
+
+### Step 1 · 配置层：flag → flag + env（容器友好）+ 从身份派生 peers 🟢
+> 容器里配置走 env/downward API，本地仍可用 flag。**优先级：flag > env > 默认**。
+- [x] 每个配置项加 env 兜底：`NODE_ID`(=`$POD_NAME`)、`LISTEN`/`PEER_PORT`/`CLIENT_PORT`、`DATA_DIR`、
+      `REPLICAS`、`STATEFULSET_NAME`、`SERVICE_DNS`、`MAX_RAFT_BYTES`。flag 显式给则覆盖 env。
+- [x] `--peers` 变为**可选**：不给则由 `REPLICAS + STATEFULSET_NAME + SERVICE_DNS + PEER_PORT` **派生成员表**
+      （决策 2）。本地脚本继续显式传 `--peers`（不回归破坏）。
+- [x] NodeID 从 `$POD_NAME` 取（downward API），ordinal 稳定。
+- **验收**：本地 `raftkvd --peers ...` 行为不变；给 env 版能自算 peers 起集群（可先用 docker-compose 验，Step 3）。
+
+### Step 2 · Dockerfile（多阶段构建）🟢
+> 实际依赖 `grpc v1.82.0` / `x/net v0.56.0` 已要求 Go 1.25，根目录 `go.work` 也是 Go 1.25.8；
+> 因此 builder 从原计划的 Go 1.22 校正为 `golang:1.25.12-bookworm`。
+- [x] 多阶段：`golang:1.25.12-bookworm` build（`CGO_ENABLED=0` 静态，pebble 是纯 Go 无 CGO 依赖 ✓）→ `distroless` 运行镜像。
+- [x] 只拷 `raftkvd`；镜像小、无源码。`raftkvctl` 保留为宿主机/独立工具，不放进每个 server 镜像。
+- [x] `ENTRYPOINT ["/usr/local/bin/raftkvd"]`，配置全走 env/flag；`EXPOSE` peer + client 两个端口。
+- [x] **验收**：`docker build` 产出 `raftkv:phase3`；单节点容器以 UID 65532 启动并可写数据目录；
+      `docker stop` 经 SIGTERM 优雅退出且 exit code=0；二次 build 全部命中 BuildKit cache。
+
+### Step 3 · docker-compose：本地多进程/多容器联调 🟢
+> 先在 compose 里验证"容器化 + env 配置 + Docker DNS + named volume"，再上 k8s（compose 比 k8s
+> 迭代快）。当前 peer/KV 仍 co-locate 在 7000；7001 只预留，两平面真拆分后在 Step 7 复验。
+- [x] 3 服务 `n1/n2/n3`，各自 env（NODE_ID、端口、DATA_DIR），`--peers` 用 compose service 名（compose 自带 DNS）。
+- [x] 各挂一个 named volume 到 DATA_DIR（模拟 PVC）；三个卷内均实测生成 Pebble + Raft WAL，owner 为 `65532:65532`。
+- [x] 起集群 → `raftkvctl` put/get → **强制重建** n2（比 `restart` 更严格）→ 从原 named volume 读回数据。
+- **验收**：compose 集群选主/复制/单容器替换恢复正常；n2 容器 ID 已变化、卷名仍为 `raftkv_n2-data`，
+  `phase3-step3=compose-ok (version=1)` 可读。三个容器均实测 `user=65532:65532`、只读 rootfs、
+  `cap_drop=ALL`、`no-new-privileges=true`（= crash 脚本的容器版 + 决策 7 权限实践）。
+
+### Step 4 · k8s：StatefulSet + headless Service + PVC 🟢（决策 1/2/3 落地）
+- [ ] **headless Service**（`clusterIP: None`）给每个 Pod 稳定 DNS（peer 平面互联靠它）。
+- [ ] **StatefulSet**：`replicas: 3`、`serviceName: raftkv`、`volumeClaimTemplates`（每 Pod 一块 PVC 挂 DATA_DIR）。
+- [ ] Pod env：downward API 注入 `POD_NAME`→NODE_ID；`REPLICAS`/`SERVICE_DNS`/端口走 env。
+- [ ] 另一个 **Service（ClusterIP/NodePort）暴露 client 端口**给外部读写（peer 端口不对外）。
+- **验收**：`kubectl apply` → 3 Pod Running、选出 leader、`raftkvctl`（或 port-forward）能读写；
+      `kubectl delete pod raftkv-1` → 自动重建、挂回 PVC、数据存活、集群自愈。
+
+### Step 5 · 探针 readiness / liveness 🟢（决策 4）
+- [ ] 加轻量 health 端点：优先 **gRPC health checking protocol**（`grpc_health_v1`，标准、k8s `grpcProbe` 直接支持）；
+      或退而求其次一个 HTTP `/healthz`（liveness）+ `/readyz`（readiness）。
+- [ ] liveness = 进程/gRPC 活着（判据弱，别用 leadership）；readiness = Raft 已参与集群、不落后太多。
+- [ ] StatefulSet 挂 `livenessProbe` / `readinessProbe`。
+- **验收**：探针不误杀 follower、不因"非 leader"把 Pod 踢出 endpoint；集群仍能选主（peer 平面未被 readiness 门控）。
+
+### Step 6 · 优雅停机 + leadership transfer 🟣（决策 5，本 Phase 唯一动 raft 处）
+- [ ] raft 加最小版 `TransferLeadership`（leader→ matchIndex 最高 follower 发 `TimeoutNow` / 立即选举信号，自己 stepDown）。
+- [ ] `main.go` 停机流程：SIGTERM → 若 leader 先 `TransferLeadership`（带超时兜底）→ 再 `GracefulStop`。
+- [ ] k8s：`preStop` hook + 合理 `terminationGracePeriodSeconds`。
+- **验收**：滚动重启 leader Pod，客户端不可用窗口 ≈ 一次 RTT（而非一个选举超时）；raft1 L1 全绿（转移是叠加、不破原选举）。
+
+### Step 7 · 拆分 peer / client 两平面 🟣（决策 6，本 Phase 最重自己写区）
+- [ ] `raftkvd` 起两个 listener + 两个 `grpc.Server`：peer 端口挂 RaftService、client 端口挂 KVService+reflection。
+- [ ] 派生 peers 用 **peer 端口**；`transport/grpc.ClientEnd` peer 互联只连 peer 端口（raftCli 与 kvCli 解耦）。
+- [ ] k8s：headless Service 暴露 peer 端口（内网 only + NetworkPolicy 限 pod↔pod）；另一 Service 暴露 client 端口。
+- [ ] 对称收尾：KV `Call` 统一收 kv Go 结构体（对齐 Raft 平面）。
+- **验收**：两平面各自端口独立可用；client 洪峰不影响 peer 心跳；L2/L1 回归绿。
+- **注**：mTLS（peer 双向）/ client server-TLS 属**信任域分离的自然延伸**，但鉴权/证书管理在 ROADMAP 已"砍"
+      （求职几乎不问）→ 本 Phase **只落地"端口/暴露/连接池"分离**，TLS 当白板讲"分了端口后怎么分别配信任域"。
+
+---
+
+## 验收总表（每步硬门槛）
 
 | Step | 硬门槛 |
 |------|--------|
-| 1 | raft1(3A-3D)+kvraft1(4A/4B) 全绿含 `-race`，行为逐字节等于改造前 |
-| 2 | 对账单测覆盖三契约（replay 抗 torn / meta 原子 / SaveSnapshot 顺序）+ 三负向变体能被抓到 |
-| 3 | fileWAL（重写压缩 + Load 锚定 snapshotIndex）通过 Step 2 全部单测（含 `-race`） |
-| 4 | KV 状态机走 pebble（磁盘模型）、与 log 分目录；appliedIndex 与写入原子提交；重启无需重建即服务 |
-| 5 | 三种崩溃场景端到端对账通过 |
+| 1 | env/flag 优先级正确；不给 `--peers` 能从身份派生成员表；本地行为不变 |
+| 2 | 多阶段镜像可 build/run；两端口 EXPOSE；纯静态无 CGO |
+| 3 | compose 3 容器选主/复制；单容器 restart 数据存活 |
+| 4 | k8s StatefulSet 选主 + 复制；`delete pod` 后挂回 PVC、数据存活、自愈 |
+| 5 | 探针不误杀 follower、不门控 peer 平面；集群仍能选主 |
+| 6 | leader 滚动重启不可用窗口 ≈ 一次 RTT；raft1 L1 全绿 |
+| 7 | peer/client 端口独立；ClientEnd 解耦；client 洪峰不扰 raft 心跳 |
 
 ## 备注 / 陷阱
-- **每步保持"原测试照旧绿"为硬门槛**（L1 回归网），任一步打破立即停、回滚该步。
-- 逐点替换 persist：**一次一个调用点**，改完立即回归，别攒着一起测（关键路径调试成本高）。
-- fsync 顺序错 = 崩溃恢复静默错数据，测试可能偶尔漏掉 → 靠 Step 2 的确定性注入兜底。
-- 方案 B（etcd 级 record WAL + 段轮转/压缩）、joint consensus、ReadIndex 都是白板延伸，本项目不写。
+- **部署层不侵入算法**（同 Phase 2 L1 保命）：Step 1–5、7 全在宿主/配置/YAML；唯一动 raft 的是 Step 6 的
+  最小 leadership transfer，且必须叠加式、跑 raft1 全回归。
+- **StatefulSet 是硬性**（翻车陷阱 #3）：Deployment 会让 Pod 名/卷漂移 → 丢/错配 Raft 数据。
+- **readiness 别拿 leadership 做门**（决策 4）：会门控 peer 平面互联 → 死锁选不出主。
+- **服务发现走静态成员集**（决策 2）：副本数固定、成员集编译期已知；动态成员变更（joint consensus）归"懂原理·不写"。
+- **停机不交权只是"能用"不是"好用"**：leader 被杀留一个选举超时窗口；Step 6 的转移把它压到一次 RTT（面试加分点）。
+- 白板延伸（不写）：joint consensus 动态成员、mTLS/证书轮转、ReadIndex/lease read（都在 ROADMAP "懂原理·不写"）。

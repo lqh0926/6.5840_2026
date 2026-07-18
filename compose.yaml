@@ -1,0 +1,92 @@
+name: raftkv
+
+services:
+  n1:
+    image: raftkv:phase3
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ID: n1
+      LISTEN: ":7000"
+      PEER_PORT: "7000"
+      CLIENT_PORT: "7001"
+      DATA_DIR: /var/lib/raftkv
+      PEERS: n1=n1:7000,n2=n2:7000,n3=n3:7000
+      MAX_RAFT_BYTES: "-1"
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    ports:
+      - "127.0.0.1:17001:7000"
+    volumes:
+      - n1-data:/var/lib/raftkv
+    networks:
+      - raftkv
+
+  n2:
+    image: raftkv:phase3
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ID: n2
+      LISTEN: ":7000"
+      PEER_PORT: "7000"
+      CLIENT_PORT: "7001"
+      DATA_DIR: /var/lib/raftkv
+      PEERS: n1=n1:7000,n2=n2:7000,n3=n3:7000
+      MAX_RAFT_BYTES: "-1"
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    ports:
+      - "127.0.0.1:17002:7000"
+    volumes:
+      - n2-data:/var/lib/raftkv
+    networks:
+      - raftkv
+
+  n3:
+    image: raftkv:phase3
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ID: n3
+      LISTEN: ":7000"
+      PEER_PORT: "7000"
+      CLIENT_PORT: "7001"
+      DATA_DIR: /var/lib/raftkv
+      PEERS: n1=n1:7000,n2=n2:7000,n3=n3:7000
+      MAX_RAFT_BYTES: "-1"
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    ports:
+      - "127.0.0.1:17003:7000"
+    volumes:
+      - n3-data:/var/lib/raftkv
+    networks:
+      - raftkv
+
+volumes:
+  n1-data:
+  n2-data:
+  n3-data:
+
+networks:
+  raftkv:
+    driver: bridge
