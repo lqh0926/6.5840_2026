@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"sort"
 	"syscall"
+	"time"
 
 	"6.5840/filewal"
 	kvraft "6.5840/kvraft1"
@@ -31,7 +32,14 @@ import (
 	"6.5840/wal"
 
 	grpclib "google.golang.org/grpc"
+	grpcHealth "google.golang.org/grpc/health"
+	grpcHealthV1 "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+)
+
+const (
+	livenessServiceName  = "raftkv-liveness"
+	readinessServiceName = "raftkv-readiness"
 )
 
 func main() {
@@ -113,10 +121,18 @@ func run(cfg config, log *slog.Logger) error {
 	srv := grpclib.NewServer()
 	proto.RegisterRaftServer(srv, grpcx.NewRaftService(rf))
 	proto.RegisterKVServer(srv, grpcx.NewKVService(kv))
+	healthSrv := grpcHealth.NewServer()
+	grpcHealthV1.RegisterHealthServer(srv, healthSrv)
+	// Use separate named statuses so Kubernetes can keep liveness deliberately
+	// weak while readiness remains an independently evolvable application gate.
+	healthSrv.SetServingStatus(livenessServiceName, grpcHealthV1.HealthCheckResponse_SERVING)
+	healthSrv.SetServingStatus(readinessServiceName, grpcHealthV1.HealthCheckResponse_NOT_SERVING)
 	reflection.Register(srv) // 便于 grpcurl 等工具免 .proto 直接调用
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(lis) }()
+	readinessStop := make(chan struct{})
+	go markReadyAfterRaftParticipation(rf, healthSrv, readinessStop)
 	log.Info("raftkvd started",
 		"listen", cfg.listen,
 		"peer_port", cfg.peerPort,
@@ -131,12 +147,41 @@ func run(cfg config, log *slog.Logger) error {
 	select {
 	case s := <-sig:
 		log.Info("shutting down", "signal", s.String())
+		close(readinessStop)
+		// Leave Service endpoints before draining in-flight RPCs. Shutdown marks
+		// every registered health service NOT_SERVING and rejects later changes.
+		healthSrv.Shutdown()
 		srv.GracefulStop() // leadership transfer 留到 Phase 3
 		return nil
 	case err := <-serveErr:
+		close(readinessStop)
+		healthSrv.Shutdown()
 		if err != nil {
 			return fmt.Errorf("grpc serve: %w", err)
 		}
 		return nil
+	}
+}
+
+// markReadyAfterRaftParticipation keeps readiness independent of leadership.
+// A positive term means this node has started an election or observed a valid
+// Raft RPC, so WAL/Pebble/Raft/gRPC initialization alone is not enough to pass.
+// GetState exposes no safe replication-lag metric; KV reads still go through
+// Raft, so we deliberately avoid inventing an unreliable lag gate here.
+func markReadyAfterRaftParticipation(rf *raft.Raft, healthSrv *grpcHealth.Server, stop <-chan struct{}) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		term, _ := rf.GetState()
+		if term > 0 {
+			healthSrv.SetServingStatus(readinessServiceName, grpcHealthV1.HealthCheckResponse_SERVING)
+			return
+		}
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
 	}
 }

@@ -73,6 +73,34 @@ spec:
             - name: rpc
               containerPort: 7000
               protocol: TCP
+          # Native gRPC probes call the standard grpc.health.v1.Health service;
+          # no shell or probe binary is needed in the distroless image.
+          startupProbe:
+            grpc:
+              port: 7000
+              service: raftkv-liveness
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          # Liveness only asks whether the process and gRPC server are alive.
+          # It must never depend on this node being the Raft leader.
+          livenessProbe:
+            grpc:
+              port: 7000
+              service: raftkv-liveness
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          # Readiness has a separate named status so its semantics can become
+          # stricter later without changing liveness or peer discovery.
+          readinessProbe:
+            grpc:
+              port: 7000
+              service: raftkv-readiness
+            periodSeconds: 2
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 2
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

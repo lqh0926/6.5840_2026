@@ -187,11 +187,29 @@ k8s 里不能手写 IP。改成**从稳定身份推导集群成员表**：
 5. **StatefulSet 是否等于持久化？** 不等于；它保证身份和 PVC 绑定，数据耐久仍取决于 PVC/PV、应用 fsync/原子写和备份策略。
 
 ### Step 5 · 探针 readiness / liveness 🟢（决策 4）
-- [ ] 加轻量 health 端点：优先 **gRPC health checking protocol**（`grpc_health_v1`，标准、k8s `grpcProbe` 直接支持）；
-      或退而求其次一个 HTTP `/healthz`（liveness）+ `/readyz`（readiness）。
-- [ ] liveness = 进程/gRPC 活着（判据弱，别用 leadership）；readiness = Raft 已参与集群、不落后太多。
-- [ ] StatefulSet 挂 `livenessProbe` / `readinessProbe`。
-- **验收**：探针不误杀 follower、不因"非 leader"把 Pod 踢出 endpoint；集群仍能选主（peer 平面未被 readiness 门控）。
+- [x] 注册标准 **gRPC health checking protocol**（`grpc_health_v1`），用两个逻辑 service name：
+      `raftkv-liveness` / `raftkv-readiness`；distroless 镜像无需 shell、curl 或额外 probe binary。
+- [x] liveness = 进程/gRPC server 活着（判据弱，绝不检查 leadership）；readiness 初始 `NOT_SERVING`，
+      WAL + Pebble + Raft + gRPC 初始化后继续等 `currentTerm > 0`（已发起选举或收到有效 Raft RPC）才置
+      `SERVING`。现有 Raft API 没有安全的 replication-lag 指标，本步不伪造 lag gate；KV 读仍走 Raft，
+      不会从落后 follower 直接读旧值。SIGTERM 时 health 先全置 `NOT_SERVING`，再 `GracefulStop`。
+- [x] StatefulSet 挂 Kubernetes 原生 `grpc` `startupProbe` / `livenessProbe` / `readinessProbe`：startup
+      `2s × 30` 给 WAL/Pebble 最多约 60s 恢复；liveness `10s × 3`；readiness `2s × 2` 快速移出 client endpoint。
+- **验收**：最终滚动更新后 3 Pod Ready、restart=0、无 `Unhealthy` event；日志实测 `raftkv-0` leader、
+  `raftkv-1/2` follower 仍全部 Ready，client EndpointSlice 含三个 Pod。删除当时的 follower `raftkv-2` 后，
+  Pod UID `e395... -> 0d170...`、PVC UID 始终为 `3225...`，新 Pod 通过 startup/readiness 且 restart=0；
+  最终读回 `phase3-step5=probes-ok (version=1)`，三节点推进到 `commit=8 applied=8`。
+
+#### Step 5 配置速查（面试复习）
+
+- `grpc.health.v1.Health/Check` 的 `service` 是同一个 gRPC server 内的**逻辑健康名**，不是 Kubernetes
+  Service；一个端口可维护多份独立状态。Kubernetes `grpcProbe.port` 用数值 7000，原生探针不依赖镜像工具。
+- `startupProbe` 成功前 kubelet 不执行 liveness/readiness，避免大 WAL 恢复期间被 liveness 杀进重启循环；
+  readiness 失败只把 Pod 移出普通 Service endpoint，不重启；liveness 连续失败才重启容器。
+- follower 返回 `ERR_WRONG_LEADER` 仍是健康行为，所以 readiness 不能等于 leader。headless peer Service 的
+  `publishNotReadyAddresses: true` 继续保证 peer DNS 不被 readiness 门控；client Service 才消费 Ready endpoint。
+- 当前 readiness 的可靠边界是“生产依赖初始化完成 + Raft term 已建立”。若未来真要按 lag 门控，必须先暴露
+  可信的 `commitIndex/appliedIndex/leaderCommit` 状态并定义阈值，不能拿 leadership 或猜测值代替。
 
 ### Step 6 · 优雅停机 + leadership transfer 🟣（决策 5，本 Phase 唯一动 raft 处）
 - [ ] raft 加最小版 `TransferLeadership`（leader→ matchIndex 最高 follower 发 `TimeoutNow` / 立即选举信号，自己 stepDown）。
