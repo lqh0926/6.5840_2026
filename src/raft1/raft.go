@@ -676,7 +676,12 @@ func (rf *Raft) TransferLeadership(ctx context.Context) error {
 		rf.mu.Unlock()
 		return raftapi.ErrNotLeader
 	}
-	// Find the node with the highest matchIndex to transfer leadership to.
+	// Best-effort transfer (shutdown availability optimization, NOT safety-load-bearing):
+	// pick the follower with the highest matchIndex and fire TimeoutNow at it directly.
+	// We do NOT first bring it fully caught up — if its log hasn't matched our lastLogIndex,
+	// TimeoutNow rejects it (see the LastLogIndex checks in TimeoutNow) and we fall back to
+	// the normal election timeout. The full Raft transfer protocol would replicate until
+	// matchIndex == lastLogIndex before sending; we skip that step on purpose.
 	var target transport.NodeID
 	maxMatchIndex := -1
 	for _, id := range rf.nodeIDs {
