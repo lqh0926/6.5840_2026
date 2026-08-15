@@ -1,5 +1,16 @@
 package raftapi
 
+import "errors"
+
+// Leadership-transfer errors are sentinel values so callers can classify the
+// failure with errors.Is without depending on error strings.
+var (
+	ErrNotLeader        = errors.New("raft: not leader")
+	ErrNoOtherNodes     = errors.New("raft: no other nodes")
+	ErrRPCFailed        = errors.New("raft: leadership transfer RPC failed")
+	ErrTransferRejected = errors.New("raft: leadership transfer rejected")
+)
+
 // The Raft interface
 type Raft interface {
 	// Start agreement on a new log entry, and return the log index

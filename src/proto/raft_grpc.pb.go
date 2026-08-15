@@ -22,6 +22,7 @@ const (
 	Raft_RequestVote_FullMethodName     = "/proto.Raft/RequestVote"
 	Raft_AppendEntries_FullMethodName   = "/proto.Raft/AppendEntries"
 	Raft_InstallSnapshot_FullMethodName = "/proto.Raft/InstallSnapshot"
+	Raft_TimeoutNow_FullMethodName      = "/proto.Raft/TimeoutNow"
 )
 
 // RaftClient is the client API for Raft service.
@@ -33,6 +34,7 @@ type RaftClient interface {
 	RequestVote(ctx context.Context, in *RequestVoteArgs, opts ...grpc.CallOption) (*RequestVoteReply, error)
 	AppendEntries(ctx context.Context, in *AppendEntriesArgs, opts ...grpc.CallOption) (*AppendEntriesReply, error)
 	InstallSnapshot(ctx context.Context, in *InstallSnapshotArgs, opts ...grpc.CallOption) (*InstallSnapshotReply, error)
+	TimeoutNow(ctx context.Context, in *TimeoutNowArgs, opts ...grpc.CallOption) (*TimeoutNowReply, error)
 }
 
 type raftClient struct {
@@ -73,6 +75,16 @@ func (c *raftClient) InstallSnapshot(ctx context.Context, in *InstallSnapshotArg
 	return out, nil
 }
 
+func (c *raftClient) TimeoutNow(ctx context.Context, in *TimeoutNowArgs, opts ...grpc.CallOption) (*TimeoutNowReply, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TimeoutNowReply)
+	err := c.cc.Invoke(ctx, Raft_TimeoutNow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServer is the server API for Raft service.
 // All implementations must embed UnimplementedRaftServer
 // for forward compatibility.
@@ -82,6 +94,7 @@ type RaftServer interface {
 	RequestVote(context.Context, *RequestVoteArgs) (*RequestVoteReply, error)
 	AppendEntries(context.Context, *AppendEntriesArgs) (*AppendEntriesReply, error)
 	InstallSnapshot(context.Context, *InstallSnapshotArgs) (*InstallSnapshotReply, error)
+	TimeoutNow(context.Context, *TimeoutNowArgs) (*TimeoutNowReply, error)
 	mustEmbedUnimplementedRaftServer()
 }
 
@@ -100,6 +113,9 @@ func (UnimplementedRaftServer) AppendEntries(context.Context, *AppendEntriesArgs
 }
 func (UnimplementedRaftServer) InstallSnapshot(context.Context, *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
 	return nil, status.Error(codes.Unimplemented, "method InstallSnapshot not implemented")
+}
+func (UnimplementedRaftServer) TimeoutNow(context.Context, *TimeoutNowArgs) (*TimeoutNowReply, error) {
+	return nil, status.Error(codes.Unimplemented, "method TimeoutNow not implemented")
 }
 func (UnimplementedRaftServer) mustEmbedUnimplementedRaftServer() {}
 func (UnimplementedRaftServer) testEmbeddedByValue()              {}
@@ -176,6 +192,24 @@ func _Raft_InstallSnapshot_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Raft_TimeoutNow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TimeoutNowArgs)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServer).TimeoutNow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Raft_TimeoutNow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServer).TimeoutNow(ctx, req.(*TimeoutNowArgs))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Raft_ServiceDesc is the grpc.ServiceDesc for Raft service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -194,6 +228,10 @@ var Raft_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InstallSnapshot",
 			Handler:    _Raft_InstallSnapshot_Handler,
+		},
+		{
+			MethodName: "TimeoutNow",
+			Handler:    _Raft_TimeoutNow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

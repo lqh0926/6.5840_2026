@@ -44,6 +44,35 @@ func requestVoteReplyFromPB(pb *proto.RequestVoteReply, r *raft.RequestVoteReply
 	r.VoteGranted = pb.VoteGranted
 }
 
+// ---- TimeoutNow（显式 leadership transfer）----
+
+func timeoutNowToPB(a *raft.TimeoutNowArgs) *proto.TimeoutNowArgs {
+	return &proto.TimeoutNowArgs{
+		Term:         int64(a.Term),
+		LeaderId:     string(a.LeaderId),
+		LastLogIndex: int64(a.LastLogIndex),
+		LastLogTerm:  int64(a.LastLogTerm),
+	}
+}
+
+func timeoutNowFromPB(pb *proto.TimeoutNowArgs) *raft.TimeoutNowArgs {
+	return &raft.TimeoutNowArgs{
+		Term:         int(pb.Term),
+		LeaderId:     transport.NodeID(pb.LeaderId),
+		LastLogIndex: int(pb.LastLogIndex),
+		LastLogTerm:  int(pb.LastLogTerm),
+	}
+}
+
+func timeoutNowReplyToPB(r *raft.TimeoutNowReply) *proto.TimeoutNowReply {
+	return &proto.TimeoutNowReply{Term: int64(r.Term), Accepted: r.Accepted}
+}
+
+func timeoutNowReplyFromPB(pb *proto.TimeoutNowReply, r *raft.TimeoutNowReply) {
+	r.Term = int(pb.Term)
+	r.Accepted = pb.Accepted
+}
+
 // ---- LogEntry ----
 
 func logEntryToPB(e raft.LogEntry) *proto.LogEntry {

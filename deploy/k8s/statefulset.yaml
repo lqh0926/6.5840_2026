@@ -101,6 +101,14 @@ spec:
             timeoutSeconds: 1
             successThreshold: 1
             failureThreshold: 2
+          lifecycle:
+            # Kubernetes removes a terminating Pod from client endpoints while
+            # this hook runs. The native sleep action works with distroless
+            # images (no /bin/sh) and lets endpoint propagation settle before
+            # SIGTERM starts leadership transfer and gRPC draining.
+            preStop:
+              sleep:
+                seconds: 2
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

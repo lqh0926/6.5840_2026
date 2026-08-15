@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -38,9 +39,16 @@ import (
 )
 
 const (
-	livenessServiceName  = "raftkv-liveness"
-	readinessServiceName = "raftkv-readiness"
+	livenessServiceName       = "raftkv-liveness"
+	readinessServiceName      = "raftkv-readiness"
+	leadershipTransferTimeout = 2 * time.Second
+	grpcDrainTimeout          = 10 * time.Second
 )
+
+type grpcServerStopper interface {
+	GracefulStop()
+	Stop()
+}
 
 func main() {
 	cfg, err := parseFlags()
@@ -83,9 +91,32 @@ func run(cfg config, log *slog.Logger) error {
 		ends[i] = ce
 		grpcEnds[i] = ce
 	}
+
+	// One cleanup stack keeps shutdown ordering explicit on both normal exit
+	// and initialization failures: stop Raft first, then peer connections,
+	// Pebble, and finally the Raft WAL.
+	var fw *filewal.FileWAL
+	var store *pebblestore.Store
+	var rf *raft.Raft
+	var err error
 	defer func() {
+		if rf != nil {
+			rf.Kill()
+		}
 		for _, ce := range grpcEnds {
-			_ = ce.Close()
+			if err := ce.Close(); err != nil {
+				log.Warn("close peer connection", "addr", ce.Addr(), "err", err)
+			}
+		}
+		if store != nil {
+			if err := store.Close(); err != nil {
+				log.Error("close pebble", "err", err)
+			}
+		}
+		if fw != nil {
+			if err := fw.Close(); err != nil {
+				log.Error("close filewal", "err", err)
+			}
 		}
 	}()
 
@@ -95,11 +126,11 @@ func run(cfg config, log *slog.Logger) error {
 	if err := os.MkdirAll(raftDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir raft dir: %w", err)
 	}
-	fw, err := filewal.Open(wal.OSFS(), raftDir)
+	fw, err = filewal.Open(wal.OSFS(), raftDir)
 	if err != nil {
 		return fmt.Errorf("open filewal: %w", err)
 	}
-	store, err := pebblestore.Open(dbDir)
+	store, err = pebblestore.Open(dbDir)
 	if err != nil {
 		return fmt.Errorf("open pebble: %w", err)
 	}
@@ -107,10 +138,11 @@ func run(cfg config, log *slog.Logger) error {
 	// --- 启动 KV 节点（内部经 rsm 创建 Raft，applyCh 喂 KV 状态机 = pebble）---
 	// maxRaftState<0：不快照（log 重放恢复）；>0：日志涨过它就 pebble.Checkpoint→blob→raft.Snapshot 压缩。
 	kv, rfi := kvraft.StartKVServerGrpc(ends, cfg.nodeID, nodeIDs, fw, store, cfg.maxRaftState)
-	rf, ok := rfi.(*raft.Raft)
+	raftImpl, ok := rfi.(*raft.Raft)
 	if !ok {
 		return fmt.Errorf("raft 返回类型非 *raft.Raft，无法挂 RaftService")
 	}
+	rf = raftImpl
 
 	// --- gRPC server 同时挂 RaftService(peer 平面) + KVService(client 平面) ---
 	// Phase 1 两平面 co-locate 在一个端口；Phase 3 再按 etcd 式拆分。
@@ -118,6 +150,7 @@ func run(cfg config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.listen, err)
 	}
+	defer lis.Close()
 	srv := grpclib.NewServer()
 	proto.RegisterRaftServer(srv, grpcx.NewRaftService(rf))
 	proto.RegisterKVServer(srv, grpcx.NewKVService(kv))
@@ -144,6 +177,7 @@ func run(cfg config, log *slog.Logger) error {
 	// --- 等 SIGTERM/SIGINT 优雅停机 ---
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sig)
 	select {
 	case s := <-sig:
 		log.Info("shutting down", "signal", s.String())
@@ -151,7 +185,27 @@ func run(cfg config, log *slog.Logger) error {
 		// Leave Service endpoints before draining in-flight RPCs. Shutdown marks
 		// every registered health service NOT_SERVING and rejects later changes.
 		healthSrv.Shutdown()
-		srv.GracefulStop() // leadership transfer 留到 Phase 3
+
+		term, isLeader := rf.GetState()
+		if isLeader {
+			ctx, cancel := context.WithTimeout(context.Background(), leadershipTransferTimeout)
+			started := time.Now()
+			err := rf.TransferLeadership(ctx)
+			cancel()
+			if err != nil {
+				// Transfer is an availability optimization, not a shutdown
+				// prerequisite. Fall back to the normal Raft election after exit.
+				log.Warn("leadership transfer failed; continuing shutdown",
+					"term", term, "elapsed", time.Since(started), "err", err)
+			} else {
+				log.Info("leadership transfer initiated",
+					"term", term, "elapsed", time.Since(started))
+			}
+		}
+
+		if !gracefulStopWithTimeout(srv, grpcDrainTimeout) {
+			log.Warn("gRPC drain timed out; forced stop", "timeout", grpcDrainTimeout)
+		}
 		return nil
 	case err := <-serveErr:
 		close(readinessStop)
@@ -160,6 +214,27 @@ func run(cfg config, log *slog.Logger) error {
 			return fmt.Errorf("grpc serve: %w", err)
 		}
 		return nil
+	}
+}
+
+// gracefulStopWithTimeout drains in-flight RPCs but guarantees that shutdown
+// cannot consume the entire Kubernetes termination grace period. It returns
+// false when Stop had to force the server down.
+func gracefulStopWithTimeout(srv grpcServerStopper, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		srv.GracefulStop()
+		close(done)
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		srv.Stop()
+		return false
 	}
 }
 

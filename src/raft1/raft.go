@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"log"
 	"math/rand"
 	"sync"
@@ -75,10 +76,34 @@ type Raft struct {
 	newEntryCh chan struct{} // signal from Start() to heartbeat goroutine: replicate immediately
 	applyCh    chan raftapi.ApplyMsg
 	applyCond  *sync.Cond
+	// electionGeneration changes whenever a valid leader/vote RPC resets the
+	// election timer or a new election begins. It closes the race where timer.C
+	// wins select just as resetCh becomes ready.
+	electionGeneration uint64
 
 	// Shutdown（Kill 用；L1 从不调用，故 done 永不关闭、行为不变）
 	dead int32         // 由 Kill() 置位，killed() 读取
 	done chan struct{} // 由 Kill() 关闭，唤醒 select-based 循环与阻塞的 applyCh 发送
+}
+
+type TimeoutNowArgs struct {
+	Term         int
+	LeaderId     transport.NodeID
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type TimeoutNowReply struct {
+	Term     int
+	Accepted bool
+}
+
+// electionRound is the immutable state captured while becoming a candidate.
+// RequestVote RPCs use this snapshot after rf.mu is released.
+type electionRound struct {
+	term         int
+	lastLogIndex int
+	lastLogTerm  int
 }
 
 // --- Log index helpers ---
@@ -156,6 +181,53 @@ func (rf *Raft) stepDown(newTerm int) {
 	rf.wal.SaveMeta(rf.term, rf.voteFor)
 }
 
+// resetElectionTimerLocked invalidates any timer created from an older
+// generation and wakes ticker so it can start a fresh randomized timeout.
+// rf.mu must be held.
+func (rf *Raft) resetElectionTimerLocked() {
+	rf.electionGeneration++
+	select {
+	case rf.resetCh <- struct{}{}:
+	default:
+	}
+}
+
+// beginElectionLocked performs the complete persistent/volatile transition to
+// Candidate atomically with the caller's trigger validation. Network RPCs are
+// intentionally sent later, after rf.mu is released.
+// rf.mu must be held.
+func (rf *Raft) beginElectionLocked() electionRound {
+	rf.term++
+	rf.customerId = Candidate
+	rf.leaderId = ""
+	rf.voteFor = rf.me
+	rf.voteCount = 1
+	rf.wal.SaveMeta(rf.term, rf.voteFor)
+	rf.resetElectionTimerLocked()
+	return electionRound{
+		term:         rf.term,
+		lastLogIndex: rf.lastLogIndex(),
+		lastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+	}
+}
+
+// sendRequestVotes starts the network portion of an election from a state
+// snapshot captured by beginElectionLocked.
+func (rf *Raft) sendRequestVotes(round electionRound) {
+	for _, id := range rf.nodeIDs {
+		if id == rf.me {
+			continue
+		}
+		args := &RequestVoteArgs{
+			Term:         round.term,
+			CandidateId:  rf.me,
+			LastLogIndex: round.lastLogIndex,
+			LastLogTerm:  round.lastLogTerm,
+		}
+		go rf.sendRequestVote(id, args, &RequestVoteReply{})
+	}
+}
+
 // --- RPC handlers ---
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -179,10 +251,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.voteFor == "" || rf.voteFor == args.CandidateId) && logOk {
 		rf.voteFor = args.CandidateId
 		rf.wal.SaveMeta(rf.term, rf.voteFor)
-		select {
-		case rf.resetCh <- struct{}{}:
-		default:
-		}
+		rf.resetElectionTimerLocked()
 		reply.VoteGranted = true
 	} else {
 		reply.VoteGranted = false
@@ -204,10 +273,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntries, reply *AppendEntriesRe
 	}
 	rf.customerId = Follower
 	rf.leaderId = args.LeaderId
-	select {
-	case rf.resetCh <- struct{}{}:
-	default:
-	}
+	rf.resetElectionTimerLocked()
 
 	// Stale RPC: leader is probing an index already covered by our snapshot.
 	// Tell leader to resume from snapshotIndex so it can try a later probe.
@@ -425,34 +491,6 @@ func (rf *Raft) randomTimeout() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-func (rf *Raft) startElection() {
-	rf.mu.Lock()
-	rf.term++
-	rf.customerId = Candidate
-	rf.voteFor = rf.me
-	rf.voteCount = 1
-	rf.wal.SaveMeta(rf.term, rf.voteFor)
-	lastIdx := rf.lastLogIndex()
-	lastTerm := rf.logs[len(rf.logs)-1].Term
-	term := rf.term
-	rf.mu.Unlock()
-
-	for _, id := range rf.nodeIDs {
-		if id == rf.me {
-			continue
-		}
-		go func(server transport.NodeID) {
-			args := &RequestVoteArgs{
-				Term:         term,
-				CandidateId:  rf.me,
-				LastLogIndex: lastIdx,
-				LastLogTerm:  lastTerm,
-			}
-			rf.sendRequestVote(server, args, &RequestVoteReply{})
-		}(id)
-	}
-}
-
 func (rf *Raft) startHeartbeat() {
 	for {
 		rf.mu.Lock()
@@ -513,15 +551,28 @@ func (rf *Raft) startHeartbeat() {
 
 func (rf *Raft) ticker() {
 	for {
+		rf.mu.Lock()
+		generation := rf.electionGeneration
+		rf.mu.Unlock()
+
 		timer := time.NewTimer(rf.randomTimeout())
 		select {
 		case <-timer.C:
 			rf.mu.Lock()
-			isLeader := rf.customerId == Leader
-			rf.mu.Unlock()
-			if !isLeader {
-				rf.startElection()
+			if rf.killed() {
+				rf.mu.Unlock()
+				return
 			}
+			// A heartbeat/vote grant may have reset the timer at the same
+			// instant timer.C became ready. The generation check makes that
+			// reset win deterministically instead of starting a stale election.
+			if rf.customerId == Leader || rf.electionGeneration != generation {
+				rf.mu.Unlock()
+				continue
+			}
+			round := rf.beginElectionLocked()
+			rf.mu.Unlock()
+			rf.sendRequestVotes(round)
 		case <-rf.resetCh:
 			if !timer.Stop() {
 				select {
@@ -582,6 +633,110 @@ func (rf *Raft) sendApplyMsg() {
 			}
 		}
 	}
+}
+
+func (rf *Raft) TimeoutNow(args *TimeoutNowArgs, reply *TimeoutNowReply) {
+	rf.mu.Lock()
+	if args.Term < rf.term {
+		reply.Term = rf.term
+		reply.Accepted = false
+		rf.mu.Unlock()
+		return
+	}
+	if args.Term > rf.term {
+		rf.stepDown(args.Term)
+	}
+	if args.LeaderId != rf.leaderId {
+		reply.Term = rf.term
+		reply.Accepted = false
+		rf.mu.Unlock()
+		return
+	}
+	if args.LastLogIndex < rf.snapshotIndex || args.LastLogIndex != rf.lastLogIndex() ||
+		rf.logAt(args.LastLogIndex).Term != args.LastLogTerm {
+		reply.Term = rf.term
+		reply.Accepted = false
+		rf.mu.Unlock()
+		return
+	}
+	round := rf.beginElectionLocked()
+	reply.Term = round.term
+	reply.Accepted = true
+	rf.mu.Unlock()
+	rf.sendRequestVotes(round)
+}
+
+func (rf *Raft) TransferLeadership(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	rf.mu.Lock()
+	if rf.customerId != Leader {
+		rf.mu.Unlock()
+		return raftapi.ErrNotLeader
+	}
+	// Find the node with the highest matchIndex to transfer leadership to.
+	var target transport.NodeID
+	maxMatchIndex := -1
+	for _, id := range rf.nodeIDs {
+		if id == rf.me {
+			continue
+		}
+		if rf.matchIndex[id] > maxMatchIndex {
+			maxMatchIndex = rf.matchIndex[id]
+			target = id
+		}
+	}
+	if target == "" {
+		rf.mu.Unlock()
+		return raftapi.ErrNoOtherNodes
+	}
+	args := &TimeoutNowArgs{
+		Term:         rf.term,
+		LeaderId:     rf.me,
+		LastLogIndex: rf.lastLogIndex(),
+		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+	}
+	peer := rf.peers[rf.nodeIndex[target]]
+	rf.mu.Unlock()
+
+	// transport.ClientEnd has no context-aware Call method. Run the RPC in a
+	// separate goroutine so shutdown can stop waiting when ctx expires. The
+	// buffered channel lets that goroutine finish even after this method has
+	// returned; the underlying Call is still bounded by its own RPC timeout.
+	type result struct {
+		reply TimeoutNowReply
+		ok    bool
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		var reply TimeoutNowReply
+		ok := peer.Call("Raft.TimeoutNow", args, &reply)
+		resultCh <- result{reply: reply, ok: ok}
+	}()
+
+	var rpcResult result
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case rpcResult = <-resultCh:
+	}
+
+	if !rpcResult.ok {
+		return raftapi.ErrRPCFailed
+	}
+
+	rf.mu.Lock()
+	if rpcResult.reply.Term > rf.term {
+		rf.stepDown(rpcResult.reply.Term)
+	}
+	rf.mu.Unlock()
+
+	if !rpcResult.reply.Accepted {
+		return raftapi.ErrTransferRejected
+	}
+	return nil
 }
 
 // --- Make ---

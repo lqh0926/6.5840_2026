@@ -106,9 +106,9 @@ and keeps the relevant course tests plus `scripts/test-crash-recovery.sh` green.
 | 2. multi-stage Dockerfile | done (`48bdd6e`) | Go 1.25 builder → static `raftkvd` only → distroless nonroot; SIGTERM exit 0; cached rebuild |
 | 3. Docker Compose | done (`48bdd6e`) | three services/DNS/independent named volumes; put/get; force-recreate one container and retain data/security controls |
 | 4. StatefulSet/headless Service/PVC | done (`f05f965`) | 3 Pods + 3 bound PVCs; derived peers elect/replicate; delete `raftkv-1`, reattach same PVC, read data |
-| 5. health probes | done (commit pending) | named standard gRPC health statuses + native startup/liveness/readiness probes; all followers remain Ready; restart recovery passes |
-| 6. leadership transfer | **next** | transfer to most caught-up follower before shutdown; rolling leader restart outage ≈ one RTT; full `make raft1` passes |
-| 7. peer/client plane split | pending | two listeners/servers and decoupled transport; peer internal-only, client Service targets real 7001; L2/L1 regressions pass |
+| 5. health probes | done (`b8a9a40`) | named standard gRPC health statuses + native startup/liveness/readiness probes; all followers remain Ready; restart recovery passes |
+| 6. leadership transfer | done (this commit) | highest-`matchIndex` TimeoutNow before bounded drain; real process/kind recovery and full `make raft1` pass |
+| 7. peer/client plane split | **next** | two listeners/servers and decoupled transport; peer internal-only, client Service targets real 7001; L2/L1 regressions pass |
 
 Completed contracts must not regress:
 
@@ -131,11 +131,22 @@ Completed Step 5 contract (do not regress):
 - Acceptance observed one leader plus two Ready followers, zero probe restarts/Unhealthy events, all three client
   endpoints, follower deletion with the same PVC, and successful data read/replication after recovery.
 
-Step 6 implementation contract:
+Completed Step 6 contract (do not regress):
 
-- Read `BUGS.md` first. Add the smallest leadership-transfer API/RPC path; choose the highest `matchIndex` follower,
-  handle term/role changes and timeouts, and do not weaken normal elections. Shutdown order is transfer (if leader) →
-  gRPC drain → process exit. Run course tests through `make raft1`, never bare `go test`.
+- `TimeoutNow` carries leader term/id and last-log index/term. The target validates the leader/log, atomically enters the
+  next election term, and returns that new term; `Accepted` means election started, not election won. The sender selects
+  the highest-`matchIndex` follower, steps down on the higher reply term, and bounds the non-context-aware transport call
+  with the caller context. Do not add a catch-up wait or election-result wait without revisiting the documented minimal
+  transfer semantics in `task.md`.
+- All election triggers use `beginElectionLocked`; `electionGeneration` invalidates timer events made stale by a valid
+  heartbeat/vote reset. Preserve this atomic trigger-to-persist transition; see `BUG-013`.
+- SIGTERM order is health shutdown → leader transfer (2s bound) → gRPC drain (10s bound) → process/resource exit.
+  Kubernetes uses native `preStop.sleep: 2s` because the distroless image has no shell, within a 30s termination grace.
+- Acceptance: full `make raft1` and `make kvraft1` passed with `-race`; crash recovery passed; real-process transfer was
+  19.269ms. In kind, transfer initiation was 5.308ms and the chosen follower became leader in the next term; Pod UID
+  changed, PVC UID/data survived, and all Pods returned Ready with zero restarts. The recreated member later campaigned
+  once more before peer reconnection settled; treat this legal extra leader churn as a Step 7 transport/reconnect
+  observation, not permission to weaken normal Raft elections.
 
 Step 7 implementation contract:
 

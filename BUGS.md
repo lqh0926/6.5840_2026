@@ -508,6 +508,45 @@ rf.snapshotIndex = args.SnapshotIndex
 
 ---
 
+### BUG-013 · 选举触发检查与 startElection 分离，过期 timer/TimeoutNow 无故抬高任期　`【High】`
+
+**文件**: `src/raft1/raft.go` — `ticker` / `TimeoutNow` / 原 `startElection`
+
+**错误代码**：
+```go
+rf.mu.Lock()
+shouldStart := rf.customerId != Leader // 或：校验 TimeoutNow 的 term/leader/log
+rf.mu.Unlock()
+
+if shouldStart {
+    rf.startElection() // 重新加锁后无条件 term++，不再验证触发条件
+}
+```
+
+**问题**：检查与状态转换之间存在解锁窗口。窗口内若合法 heartbeat、RequestVoteReply 或更高任期 RPC 改变状态，旧调用仍会无条件 `term++`：刚当选的 leader 会立刻退回 Candidate，已稳定的新 leader 也可能被旧 TimeoutNow 推到更高任期。两个并发 TimeoutNow 还可能连续启动 T+1、T+2 两轮选举。Raft safety 通常仍由任期/投票/日志约束保护，但会产生 leader 抖动、额外 `ErrWrongLeader` 与完整 election-timeout 级别的可用性中断。
+
+仅把角色/term 检查搬进 `startElection` 仍不完整：合法同任期 heartbeat 不改变 term，且 `timer.C` 与 `resetCh` 同时 ready 时 Go `select` 可任意选择 timer 分支，仍可能启动已经被 heartbeat 作废的选举。
+
+**正确做法**：
+
+1. 用 `beginElectionLocked` 在调用方持锁时一次完成「验证触发条件 → term++ → Candidate → self vote → 持久化 → 捕获日志位置」；解锁后只负责发送 RequestVote。
+2. 每次合法 leader/vote RPC 重置计时器、以及每次开始新选举时递增 `electionGeneration`。ticker 创建 timer 时捕获 generation；timer 到期后只有 generation 未变且当前不是 Leader 才能进入 Candidate。
+
+```go
+rf.mu.Lock()
+if rf.customerId == Leader || rf.electionGeneration != capturedGeneration {
+    rf.mu.Unlock()
+    continue
+}
+round := rf.beginElectionLocked()
+rf.mu.Unlock()
+rf.sendRequestVotes(round)
+```
+
+**核心 Raft 不变式**: 「触发某轮选举的条件仍成立」与「持久化该轮新 term/self vote」必须属于同一个锁内状态转换；网络发送可以锁外执行，但不能让已经被 leader 活动或更高任期作废的事件再次推进任期。
+
+---
+
 ## Lab 4 — Fault-tolerant KV
 
 > 本节多为**设计阶段讨论结论**与 **2026 版 vs 2024 版差异**梳理，非运行期崩溃型 bug，但都是极易绕进去的理解陷阱。

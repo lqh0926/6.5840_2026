@@ -74,6 +74,7 @@ func (c *ClientEnd) Close() error {
 //	Raft.RequestVote           → *raft.RequestVoteArgs / *raft.RequestVoteReply
 //	Raft.AppendEntriesHandler  → *raft.AppendEntries   / *raft.AppendEntriesReply
 //	                             （Snapshot!=nil 时内部路由到 gRPC InstallSnapshot）
+//	Raft.TimeoutNow           → *raft.TimeoutNowArgs  / *raft.TimeoutNowReply
 //	KVServer.Get               → *proto.GetArgs   / *proto.GetReply
 //	KVServer.Put               → *proto.PutArgs   / *proto.PutReply
 //	KVServer.Append            → *proto.AppendArgs / *proto.AppendReply
@@ -135,6 +136,22 @@ func (c *ClientEnd) Call(svcMeth string, args any, reply any) bool {
 			return false
 		}
 		appendEntriesReplyFromPB(resp, r)
+		return true
+
+	case "Raft.TimeoutNow":
+		a, ok := args.(*raft.TimeoutNowArgs)
+		if !ok {
+			return false
+		}
+		r, ok := reply.(*raft.TimeoutNowReply)
+		if !ok {
+			return false
+		}
+		resp, err := c.raftCli.TimeoutNow(ctx, timeoutNowToPB(a))
+		if err != nil {
+			return false
+		}
+		timeoutNowReplyFromPB(resp, r)
 		return true
 
 	// ── KV client 平面 ──────────────────────────────────────────

@@ -461,6 +461,130 @@ func (x *InstallSnapshotReply) GetTerm() int64 {
 	return 0
 }
 
+// TimeoutNow RPC — the current leader asks one fully caught-up follower to
+// start an election immediately during an explicit leadership transfer.
+// last_log_* lets the follower verify that it contains the leader's latest
+// entry before accepting; accepted means "election triggered", not "elected".
+type TimeoutNowArgs struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          int64                  `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId      string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"` // transport.NodeID
+	LastLogIndex  int64                  `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm   int64                  `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TimeoutNowArgs) Reset() {
+	*x = TimeoutNowArgs{}
+	mi := &file_proto_raft_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TimeoutNowArgs) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TimeoutNowArgs) ProtoMessage() {}
+
+func (x *TimeoutNowArgs) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TimeoutNowArgs.ProtoReflect.Descriptor instead.
+func (*TimeoutNowArgs) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *TimeoutNowArgs) GetTerm() int64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *TimeoutNowArgs) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
+func (x *TimeoutNowArgs) GetLastLogIndex() int64 {
+	if x != nil {
+		return x.LastLogIndex
+	}
+	return 0
+}
+
+func (x *TimeoutNowArgs) GetLastLogTerm() int64 {
+	if x != nil {
+		return x.LastLogTerm
+	}
+	return 0
+}
+
+type TimeoutNowReply struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          int64                  `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Accepted      bool                   `protobuf:"varint,2,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TimeoutNowReply) Reset() {
+	*x = TimeoutNowReply{}
+	mi := &file_proto_raft_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TimeoutNowReply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TimeoutNowReply) ProtoMessage() {}
+
+func (x *TimeoutNowReply) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TimeoutNowReply.ProtoReflect.Descriptor instead.
+func (*TimeoutNowReply) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *TimeoutNowReply) GetTerm() int64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *TimeoutNowReply) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
 var File_proto_raft_proto protoreflect.FileDescriptor
 
 const file_proto_raft_proto_rawDesc = "" +
@@ -495,11 +619,21 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\x12last_included_term\x18\x04 \x01(\x03R\x10lastIncludedTerm\x12\x12\n" +
 	"\x04data\x18\x05 \x01(\fR\x04data\"*\n" +
 	"\x14InstallSnapshotReply\x12\x12\n" +
-	"\x04term\x18\x01 \x01(\x03R\x04term2\xd8\x01\n" +
+	"\x04term\x18\x01 \x01(\x03R\x04term\"\x8b\x01\n" +
+	"\x0eTimeoutNowArgs\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x03R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12$\n" +
+	"\x0elast_log_index\x18\x03 \x01(\x03R\flastLogIndex\x12\"\n" +
+	"\rlast_log_term\x18\x04 \x01(\x03R\vlastLogTerm\"A\n" +
+	"\x0fTimeoutNowReply\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x03R\x04term\x12\x1a\n" +
+	"\baccepted\x18\x02 \x01(\bR\baccepted2\x95\x02\n" +
 	"\x04Raft\x12>\n" +
 	"\vRequestVote\x12\x16.proto.RequestVoteArgs\x1a\x17.proto.RequestVoteReply\x12D\n" +
 	"\rAppendEntries\x12\x18.proto.AppendEntriesArgs\x1a\x19.proto.AppendEntriesReply\x12J\n" +
-	"\x0fInstallSnapshot\x12\x1a.proto.InstallSnapshotArgs\x1a\x1b.proto.InstallSnapshotReplyB\x0eZ\f6.5840/protob\x06proto3"
+	"\x0fInstallSnapshot\x12\x1a.proto.InstallSnapshotArgs\x1a\x1b.proto.InstallSnapshotReply\x12;\n" +
+	"\n" +
+	"TimeoutNow\x12\x15.proto.TimeoutNowArgs\x1a\x16.proto.TimeoutNowReplyB\x0eZ\f6.5840/protob\x06proto3"
 
 var (
 	file_proto_raft_proto_rawDescOnce sync.Once
@@ -513,7 +647,7 @@ func file_proto_raft_proto_rawDescGZIP() []byte {
 	return file_proto_raft_proto_rawDescData
 }
 
-var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_proto_raft_proto_goTypes = []any{
 	(*LogEntry)(nil),             // 0: proto.LogEntry
 	(*RequestVoteArgs)(nil),      // 1: proto.RequestVoteArgs
@@ -522,17 +656,21 @@ var file_proto_raft_proto_goTypes = []any{
 	(*AppendEntriesReply)(nil),   // 4: proto.AppendEntriesReply
 	(*InstallSnapshotArgs)(nil),  // 5: proto.InstallSnapshotArgs
 	(*InstallSnapshotReply)(nil), // 6: proto.InstallSnapshotReply
+	(*TimeoutNowArgs)(nil),       // 7: proto.TimeoutNowArgs
+	(*TimeoutNowReply)(nil),      // 8: proto.TimeoutNowReply
 }
 var file_proto_raft_proto_depIdxs = []int32{
 	0, // 0: proto.AppendEntriesArgs.entries:type_name -> proto.LogEntry
 	1, // 1: proto.Raft.RequestVote:input_type -> proto.RequestVoteArgs
 	3, // 2: proto.Raft.AppendEntries:input_type -> proto.AppendEntriesArgs
 	5, // 3: proto.Raft.InstallSnapshot:input_type -> proto.InstallSnapshotArgs
-	2, // 4: proto.Raft.RequestVote:output_type -> proto.RequestVoteReply
-	4, // 5: proto.Raft.AppendEntries:output_type -> proto.AppendEntriesReply
-	6, // 6: proto.Raft.InstallSnapshot:output_type -> proto.InstallSnapshotReply
-	4, // [4:7] is the sub-list for method output_type
-	1, // [1:4] is the sub-list for method input_type
+	7, // 4: proto.Raft.TimeoutNow:input_type -> proto.TimeoutNowArgs
+	2, // 5: proto.Raft.RequestVote:output_type -> proto.RequestVoteReply
+	4, // 6: proto.Raft.AppendEntries:output_type -> proto.AppendEntriesReply
+	6, // 7: proto.Raft.InstallSnapshot:output_type -> proto.InstallSnapshotReply
+	8, // 8: proto.Raft.TimeoutNow:output_type -> proto.TimeoutNowReply
+	5, // [5:9] is the sub-list for method output_type
+	1, // [1:5] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
 	1, // [1:1] is the sub-list for extension extendee
 	0, // [0:1] is the sub-list for field type_name
@@ -549,7 +687,7 @@ func file_proto_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_raft_proto_rawDesc), len(file_proto_raft_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

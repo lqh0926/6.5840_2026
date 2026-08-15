@@ -212,10 +212,37 @@ k8s 里不能手写 IP。改成**从稳定身份推导集群成员表**：
   可信的 `commitIndex/appliedIndex/leaderCommit` 状态并定义阈值，不能拿 leadership 或猜测值代替。
 
 ### Step 6 · 优雅停机 + leadership transfer 🟣（决策 5，本 Phase 唯一动 raft 处）
-- [ ] raft 加最小版 `TransferLeadership`（leader→ matchIndex 最高 follower 发 `TimeoutNow` / 立即选举信号，自己 stepDown）。
-- [ ] `main.go` 停机流程：SIGTERM → 若 leader 先 `TransferLeadership`（带超时兜底）→ 再 `GracefulStop`。
-- [ ] k8s：`preStop` hook + 合理 `terminationGracePeriodSeconds`。
-- **验收**：滚动重启 leader Pod，客户端不可用窗口 ≈ 一次 RTT（而非一个选举超时）；raft1 L1 全绿（转移是叠加、不破原选举）。
+- [x] raft 加最小版 `TransferLeadership`：leader 选 `matchIndex` 最高的 follower，发
+      `TimeoutNow`；目标精确校验 leader 最后日志的 index/term，锁内原子进入新任期 Candidate。
+      `Accepted` 只表示已开始选举，回复携带新 term，旧 leader 观察到更高 term 后 stepDown。
+- [x] 所有选举入口收敛到 `beginElectionLocked`：“校验触发条件 → term++ → Candidate →
+      self-vote → 持久化”在同一把锁内完成；`electionGeneration` 使旧 timer 与重放/并发
+      `TimeoutNow` 无法无故抬高任期（详见 `BUG-013`）。
+- [x] `main.go` 停机流程：SIGTERM → health/readiness 下线 → 若 leader 则用 2s context
+      发起 transfer → `GracefulStop`（最多 10s，超时强制 `Stop`）→ `Raft.Kill` 与 peer/Pebble/fileWAL
+      资源关闭。transfer 失败是 availability 降级，不阻止有界退出。
+- [x] k8s：distroless 没有 shell，因此使用 Kubernetes 原生 `preStop.sleep: 2s`，继续由
+      `terminationGracePeriodSeconds: 30` 覆盖 endpoint 传播、交权与 gRPC drain。
+- **验收**：`make raft1` 全量 `-race` 通过（`404.532s`），`make kvraft1` 全量 `-race`
+  通过（`247.126s`），`scripts/test-crash-recovery.sh` 通过。本地三进程 leader 交权耗时
+  `19.269ms`，停机后立即读回 `phase3-step6=transfer-ok (version=1)`。kind 中删除 leader
+  `raftkv-0` 时，旧 leader 在 `5.308ms` 内记录 `leadership transfer initiated`，`raftkv-1`
+  不等普通 election timeout 就进入 term 125 Leader；Pod UID 变更而 PVC UID 仍为
+  `8dd040ed-43bb-4dde-9812-4ca290788aac`，重建后读回 `phase3-step6-kind=transfer-ok (version=1)`。
+
+#### Step 6 配置/算法速查（面试复习）
+
+- `GracefulStop` 只是“不收新 RPC + 排空在途 RPC”，不改变 Raft 角色；`TimeoutNow` 才是
+  跳过 follower 随机 election timeout 的交权信号。
+- 选 `matchIndex` 最高者是为了最大化目标已追平的概率。本项目的最小版不在停机路径等它追日志；
+  目标若不含 leader 的最后 index/term 就拒绝，主进程在 2s 后回退到正常选举。
+- `Accepted=true` 不是“已当选”，只是“已原子进入 Candidate 并发出 RequestVote”。停机
+  不必等待最终当选：交权是优化，Raft 的任期/多数派/日志规则仍负责正确性。
+- `preStop.sleep` 发生在 SIGTERM **之前**，用于给 endpoint 变化传播时间；2s 不是交权算法
+  的耗时。30s 终止宽限中，transfer 2s + drain 10s 有明确上界，仍给 kubelet 留有余量。
+- kind 实验中，新 `raftkv-0` 启动后在 peer gRPC/DNS 重连完成前又发起 term 126 选举并
+  合法抢回 leader；它不否定 term 125 主动交权，但会多一次 leader churn。Step 7 拆分/理顺
+  peer transport 后可继续评估 gRPC reconnect backoff 或重启节点的 campaign grace，不在本步改弱正常选举。
 
 ### Step 7 · 拆分 peer / client 两平面 🟣（决策 6，本 Phase 最重自己写区）
 - [ ] `raftkvd` 起两个 listener + 两个 `grpc.Server`：peer 端口挂 RaftService、client 端口挂 KVService+reflection。

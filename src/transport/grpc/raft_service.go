@@ -10,8 +10,8 @@ import (
 // RaftService 把一个 *raft.Raft 适配成生成的 proto.RaftServer，
 // 使 Raft 节点能通过 gRPC 对外提供 peer 平面服务。
 //
-// 它只做「翻译」：proto → raft Go 结构体 → 调用【原样未改】的 raft handler →
-// 结果转回 proto。raft 的算法代码一行不动。
+// 它只做「翻译」：proto → raft Go 结构体 → 调用 raft handler → 结果转回
+// proto；共识状态仍只由 raft1 管理。
 //
 // 注意：raft 的三个 handler（RequestVote / AppendEntriesHandler /
 // 折叠在其中的快照分支）是 *raft.Raft 的导出方法，不在 raftapi.Raft 接口里，
@@ -49,4 +49,13 @@ func (s *RaftService) InstallSnapshot(_ context.Context, pb *proto.InstallSnapsh
 	var reply raft.AppendEntriesReply
 	s.rf.AppendEntriesHandler(args, &reply)
 	return &proto.InstallSnapshotReply{Term: int64(reply.Term)}, nil
+}
+
+// TimeoutNow 是 leadership transfer 的最小 peer RPC。Accepted 只表示目标
+// follower 已同步进入下一任期并开始选举，不表示它已经当选。
+func (s *RaftService) TimeoutNow(_ context.Context, pb *proto.TimeoutNowArgs) (*proto.TimeoutNowReply, error) {
+	args := timeoutNowFromPB(pb)
+	var reply raft.TimeoutNowReply
+	s.rf.TimeoutNow(args, &reply)
+	return timeoutNowReplyToPB(&reply), nil
 }
